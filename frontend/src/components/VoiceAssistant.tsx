@@ -14,6 +14,8 @@ export type VoiceState =
 
 interface VoiceAssistantProps {
   apiUrl: string;
+  conversationId?: number | null;
+  onConversationIdChange?: (id: number) => void;
   onSwitchToTextChat?: () => void;
 }
 
@@ -58,7 +60,12 @@ interface ExtendedWindow extends Window {
   webkitAudioContext?: typeof AudioContext;
 }
 
-export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssistantProps) {
+export default function VoiceAssistant({
+  apiUrl,
+  conversationId,
+  onConversationIdChange,
+  onSwitchToTextChat,
+}: VoiceAssistantProps) {
   // Conversational State Machine
   const [state, setState] = useState<VoiceState>("IDLE");
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -74,6 +81,9 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
   const [sessionLogs, setSessionLogs] = useState<Array<{ id: string; sender: "user" | "kela"; text: string; time: string }>>([]);
 
   // Audio & Speech References
+  const conversationIdRef = useRef<number | null>(conversationId || null);
+  const onConversationIdChangeRef = useRef<((id: number) => void) | undefined>(onConversationIdChange);
+  const lastProcessedUtteranceRef = useRef<{ text: string; time: number }>({ text: "", time: 0 });
   const recognitionRef = useRef<ISpeechRecognition | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -104,6 +114,14 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
   useEffect(() => {
     isSessionActiveRef.current = isSessionActive;
   }, [isSessionActive]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId || null;
+  }, [conversationId]);
+
+  useEffect(() => {
+    onConversationIdChangeRef.current = onConversationIdChange;
+  }, [onConversationIdChange]);
 
   // Fetch initial system telemetry
   useEffect(() => {
@@ -406,7 +424,19 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
   // Process Completed Voice Utterance (Autonomous Backend Pipeline)
   const processVoiceUtterance = useCallback(
     async (utteranceText: string) => {
-      if (!utteranceText.trim() || isProcessingRef.current) return;
+      const cleanText = utteranceText.trim();
+      if (!cleanText || isProcessingRef.current) return;
+
+      // Duplicate transcription suppression (Requirement 10)
+      const now = Date.now();
+      if (
+        lastProcessedUtteranceRef.current.text.toLowerCase() === cleanText.toLowerCase() &&
+        now - lastProcessedUtteranceRef.current.time < 2500
+      ) {
+        console.log("Suppressing duplicate voice utterance:", cleanText);
+        return;
+      }
+      lastProcessedUtteranceRef.current = { text: cleanText, time: now };
 
       // Clear any pending timers
       if (silenceTimerRef.current) {
@@ -416,12 +446,12 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
 
       isProcessingRef.current = true;
       setState("PROCESSING");
-      setLiveTranscript(utteranceText);
+      setLiveTranscript(cleanText);
 
       const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       setSessionLogs((prev) => [
         ...prev,
-        { id: String(Date.now()), sender: "user", text: utteranceText, time: timeStr },
+        { id: String(Date.now()), sender: "user", text: cleanText, time: timeStr },
       ]);
 
       // Stop speech recognizer temporarily during processing & speaking
@@ -434,12 +464,17 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       }
 
       abortControllerRef.current = new AbortController();
+      const turnId = `voice_${Date.now()}`;
 
       try {
         const response = await fetch(`${apiUrl}/api/voice/conversation`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: utteranceText }),
+          body: JSON.stringify({
+            text: cleanText,
+            conversation_id: conversationIdRef.current,
+            turn_id: turnId,
+          }),
           signal: abortControllerRef.current.signal,
         });
 
@@ -448,11 +483,18 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
         }
 
         const data = (await response.json()) as {
+          conversation_id?: number;
+          turn_id?: string;
           response_text?: string;
           action?: string;
           lang?: string;
           fast_path?: boolean;
         };
+
+        if (data.conversation_id) {
+          conversationIdRef.current = data.conversation_id;
+          onConversationIdChangeRef.current?.(data.conversation_id);
+        }
 
         const spokenAnswer = data.response_text || "I have completed the task.";
         const lang = data.lang || "english";

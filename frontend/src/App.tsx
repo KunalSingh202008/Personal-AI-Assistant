@@ -976,7 +976,10 @@ export default function App() {
           </button>
           <button
             className={`nav-tab ${activeTab === "chat" ? "active" : ""}`}
-            onClick={() => setActiveTab("chat")}
+            onClick={() => {
+              if (conversationId) void selectChat(conversationId);
+              setActiveTab("chat");
+            }}
           >
             💬 Chat & Assistant
           </button>
@@ -1059,7 +1062,15 @@ export default function App() {
       {activeTab === "voice" && (
         <VoiceAssistant
           apiUrl={apiUrl}
-          onSwitchToTextChat={() => setActiveTab("chat")}
+          conversationId={conversationId}
+          onConversationIdChange={(id) => {
+            setConversationId(id);
+            void refreshConversations();
+          }}
+          onSwitchToTextChat={() => {
+            if (conversationId) void selectChat(conversationId);
+            setActiveTab("chat");
+          }}
         />
       )}
       {activeTab === "pc" && <PCControlView apiUrl={apiUrl} />}

@@ -49,7 +49,7 @@ def detect_language(text: str) -> str:
     return "hinglish" if matches >= 1 else "english"
 
 async def ask_voice_llm(prompt: str, lang: str = "english") -> str:
-    """Fast conversational query to Ollama for voice interaction (max 30 tokens, 3.5s timeout)."""
+    """Fast conversational query for voice interaction (max 30 tokens, 3.5s timeout)."""
     system_prompt = (
         "You are KELA, an ultra-fast voice assistant for Kunal Singh. "
         "Answer in ONE short, natural spoken sentence (under 25 words). "
@@ -83,10 +83,10 @@ async def ask_voice_llm(prompt: str, lang: str = "english") -> str:
         
     return "I am right here with you, Kunal. How can I help next?" if lang == "english" else "Haan Kunal, main sun raha hoon. Kya karna hai?"
 
-async def dispatch_voice_command(text: str) -> Dict[str, Any]:
+def resolve_voice_intent(text: str) -> Dict[str, Any]:
     """
-    Sub-millisecond unified voice command router.
-    Executes native C/Win32 tools and returns instant conversational responses.
+    Parses natural language voice prompt into structured action metadata.
+    Does NOT execute PC actions; provides intent for security checking in KelaEngine.
     """
     _, query = is_wake_word_present(text)
     clean = query.strip()
@@ -95,16 +95,39 @@ async def dispatch_voice_command(text: str) -> Dict[str, Any]:
     
     if not clean:
         resp = "Haan boliye Kunal, main sun raha hoon." if lang == "hinglish" else "Yes Kunal, I'm listening."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "greeting", "lang": lang}
+        return {
+            "action": "greeting",
+            "fast_path": True,
+            "response_text": resp,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
     # 1. Session control: Stop / Exit / Pause
     if re.search(r'\b(stop listening|stop session|bye kela|bye|so jao|exit voice|shut down voice)\b', lower):
         resp = "Alvida Kunal, voice session band kar raha hoon." if lang == "hinglish" else "Stopping listening. Call me whenever you need me, Kunal."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "stop_listening", "stop_session": True, "lang": lang}
+        return {
+            "action": "stop_listening",
+            "fast_path": True,
+            "response_text": resp,
+            "stop_session": True,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
     if re.search(r'\b(pause listening|pause session|ruk jao|wait a minute)\b', lower):
         resp = "Voice listening pause kar di hai." if lang == "hinglish" else "Listening paused. Say resume or click the mic when you're ready."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "pause_listening", "pause_session": True, "lang": lang}
+        return {
+            "action": "pause_listening",
+            "fast_path": True,
+            "response_text": resp,
+            "pause_session": True,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
     # 2. Assistant Identity & Capabilities
     if re.search(r'\b(who are you|what is your name|tum kaun ho|naam kya hai)\b', lower):
@@ -113,7 +136,14 @@ async def dispatch_voice_command(text: str) -> Dict[str, Any]:
             if lang == "hinglish" else
             "I am KELA, your personal voice assistant and autonomous operating system."
         )
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "assistant_identity", "lang": lang}
+        return {
+            "action": "assistant_identity",
+            "fast_path": True,
+            "response_text": resp,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
     if re.search(r'\b(what can you do|kya kar sakte ho|help me|features)\b', lower):
         resp = (
@@ -121,16 +151,30 @@ async def dispatch_voice_command(text: str) -> Dict[str, Any]:
             if lang == "hinglish" else
             "I can launch your applications, manage system audio, search your local files, browse the web, and answer your questions."
         )
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "help", "lang": lang}
+        return {
+            "action": "help",
+            "fast_path": True,
+            "response_text": resp,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
-    # 3. Personal Context & User Profile (Section 6)
+    # 3. Personal Context & User Profile
     if re.search(r'\b(who am i|mera naam kya hai|do you know me|who is kunal)\b', lower):
         resp = (
             "Aap Kunal Singh hain, B.Tech Computer Science ke student aur AI developer. Aap Nexus AI, StreeSure, aur ClassTrack AI par kaam kar rahe hain."
             if lang == "hinglish" else
             "You are Kunal Singh, a B.Tech Computer Science student and AI developer building Nexus AI, StreeSure, and ClassTrack AI."
         )
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "identity", "lang": lang}
+        return {
+            "action": "identity",
+            "fast_path": True,
+            "response_text": resp,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
     if re.search(r'\b(my projects|tell me about my projects|current projects|mere projects)\b', lower):
         resp = (
@@ -138,152 +182,402 @@ async def dispatch_voice_command(text: str) -> Dict[str, Any]:
             if lang == "hinglish" else
             "Your core projects are Nexus AI, your personal AI operating system, StreeSure for safety analytics, and ClassTrack AI for student workflows."
         )
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "projects_info", "lang": lang}
+        return {
+            "action": "projects_info",
+            "fast_path": True,
+            "response_text": resp,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
     if re.search(r'\b(hello|hi|hey|kya haal hai|kaise ho|how are you)\b', lower) and len(clean.split()) <= 4:
         resp = "Main badhiya hoon Kunal! Boliye, kis project ya task par kaam karein?" if lang == "hinglish" else "Hello Kunal! I am doing great. What would you like to work on next?"
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "greeting", "lang": lang}
+        return {
+            "action": "greeting",
+            "fast_path": True,
+            "response_text": resp,
+            "lang": lang,
+            "clean_query": clean,
+            "data": None,
+        }
 
-    # 4. Instant Audio / Volume Controls (<0.1ms via ctypes)
+    # 4. Instant Audio / Volume Controls
     if re.search(r'\b(volume up|increase volume|louder|awaz badhao|volume badhao)\b', lower):
-        res = change_volume("up", 5)
-        resp = "Volume badha diya hai." if lang == "hinglish" else "Volume increased."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "volume_up", "data": res, "lang": lang}
+        return {
+            "action": "volume_up",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"direction": "up", "steps": 5},
+        }
 
     if re.search(r'\b(volume down|decrease volume|softer|awaz kam karo|volume kam karo)\b', lower):
-        res = change_volume("down", 5)
-        resp = "Volume kam kar diya hai." if lang == "hinglish" else "Volume decreased."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "volume_down", "data": res, "lang": lang}
+        return {
+            "action": "volume_down",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"direction": "down", "steps": 5},
+        }
 
     if re.search(r'\b(mute|unmute|awaz band karo|chup ho jao)\b', lower):
-        res = toggle_mute()
-        resp = "Audio mute toggle kar diya." if lang == "hinglish" else "Audio mute toggled."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "toggle_mute", "data": res, "lang": lang}
+        return {
+            "action": "toggle_mute",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
 
     vol_match = re.search(r'(?:set volume to|volume)\s+(\d{1,3})\s*(?:percent|%)?', lower)
     if vol_match:
         target_val = int(vol_match.group(1))
-        res = set_volume(target_val)
-        resp = f"Volume {target_val} percent par set kar diya." if lang == "hinglish" else f"Volume set to {target_val}%."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "set_volume", "data": res, "lang": lang}
+        return {
+            "action": "set_volume",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"level": target_val},
+        }
 
-    # 5. Native App Launchers (Camera, Chrome, VS Code, Calculator, Notepad, Spotify, YouTube, Explorer)
+    # 5. Native App Launchers
     if re.search(r'\b(open camera|camera kholo|webcam kholo)\b', lower):
-        res = launch_application("camera")
-        resp = "Camera khol diya hai." if lang == "hinglish" else "Opening your camera."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_camera", "data": res, "lang": lang}
+        return {
+            "action": "launch_camera",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"app": "camera"},
+        }
 
     if re.search(r'\b(open youtube|youtube kholo|play youtube)\b', lower):
-        res = launch_application("youtube")
-        resp = "YouTube open kar diya hai." if lang == "hinglish" else "Opening YouTube in your browser."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_youtube", "data": res, "lang": lang}
+        return {
+            "action": "launch_youtube",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"app": "youtube"},
+        }
 
     if re.search(r'\b(open (?:the )?(?:browser|chrome|google chrome)|chrome kholo|browser kholo)\b', lower):
-        res = launch_application("chrome")
-        resp = "Google Chrome khol diya hai." if lang == "hinglish" else "Opening Google Chrome."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_chrome", "data": res, "lang": lang}
+        return {
+            "action": "launch_chrome",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"app": "chrome"},
+        }
 
     if re.search(r'\b(open (?:vs code|vscode|code editor)|code kholo)\b', lower):
-        res = launch_application("code")
-        resp = "VS Code khol diya hai." if lang == "hinglish" else "Opening VS Code."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_vscode", "data": res, "lang": lang}
+        return {
+            "action": "launch_vscode",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"app": "code"},
+        }
 
     if re.search(r'\b(open (?:calculator|calc)|calculator kholo|calc kholo)\b', lower):
-        res = launch_application("calculator")
-        resp = "Calculator khol diya hai." if lang == "hinglish" else "Opening Calculator."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_calculator", "data": res, "lang": lang}
+        return {
+            "action": "launch_calculator",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"app": "calculator"},
+        }
 
     if re.search(r'\b(open (?:notepad|editor)|notepad kholo)\b', lower):
-        res = launch_application("notepad")
-        resp = "Notepad khol diya hai." if lang == "hinglish" else "Opening Notepad."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_notepad", "data": res, "lang": lang}
+        return {
+            "action": "launch_notepad",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"app": "notepad"},
+        }
 
     open_app_match = re.search(r'\b(?:open|launch|start|kholo|chalao)\s+([a-zA-Z0-9_\- ]+)\b', lower)
     if open_app_match and not re.search(r'\b(?:website|link|page|url|tab|file|folder|resume|pdf)\b', lower):
         app_target = open_app_match.group(1).replace("kholo", "").replace("chalao", "").strip()
         if app_target in ["spotify", "task manager", "paint", "explorer", "files"]:
-            res = launch_application(app_target)
-            resp = f"{app_target.title()} khol diya hai." if lang == "hinglish" else f"Opening {app_target.title()}."
-            return {"handled": True, "fast_path": True, "response_text": resp, "action": "launch_app", "data": res, "lang": lang}
+            return {
+                "action": "launch_app",
+                "fast_path": True,
+                "lang": lang,
+                "clean_query": clean,
+                "params": {"app": app_target},
+            }
 
     # 6. Close Applications
     close_match = re.search(r'\b(?:close|quit|exit|band karo)\s+([a-zA-Z0-9_\- ]+)\b', lower)
     if close_match:
         app_target = close_match.group(1).replace("band karo", "").strip()
         if app_target in ["notepad", "calculator", "calc", "chrome", "vscode", "spotify", "paint", "camera"]:
-            res = close_application(app_target)
-            resp = f"{app_target.title()} band kar diya." if lang == "hinglish" else f"Closed {app_target.title()}."
-            return {"handled": True, "fast_path": True, "response_text": resp, "action": "close_app", "data": res, "lang": lang}
+            return {
+                "action": "close_app",
+                "fast_path": True,
+                "lang": lang,
+                "clean_query": clean,
+                "params": {"app": app_target},
+            }
 
-    # 7. File Operations: Resume, Latest PDF, Downloads
+    # 7. File Operations
     if re.search(r'\b(find (?:my )?resume|where is my resume|resume dhundo|resume dhundho|open my resume)\b', lower):
+        return {
+            "action": "find_resume",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    if re.search(r'\b(open (?:my )?latest pdf|latest pdf kholo|latest document)\b', lower):
+        return {
+            "action": "open_latest_pdf",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    if re.search(r'\b(open (?:my )?downloads(?: folder)?|downloads kholo)\b', lower):
+        return {
+            "action": "open_downloads",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    # 8. Web Search
+    web_search_match = re.search(r'\b(?:search (?:the )?(?:internet|web) for|google|search for|find(?: the)? latest)\s+([a-zA-Z0-9_\- ]+)\b', lower)
+    if web_search_match and not re.search(r'\b(?:file|folder|document|pdf|resume)\b', lower):
+        search_query = web_search_match.group(1).strip()
+        return {
+            "action": "web_search",
+            "fast_path": False,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {"query": search_query},
+        }
+
+    # 9. Screenshots
+    if re.search(r'\b(take (?:a )?screenshot|capture screen|screen capture|screenshot lo|screenshot le lo)\b', lower):
+        return {
+            "action": "screenshot",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    # 10. Battery & Telemetry
+    if re.search(r'\b(battery|charge|charging|battery kitni hai|battery status)\b', lower):
+        return {
+            "action": "battery_status",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    if re.search(r'\b(cpu usage|ram usage|system info|system status|performance|pc ka haal)\b', lower):
+        return {
+            "action": "system_status",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    # 11. Time & Date
+    if re.search(r'\b(what time is it|current time|kya samay hua|time batao|kitne baje hain)\b', lower):
+        return {
+            "action": "time",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    if re.search(r'\b(today\'?s? date|what is today|aaj ki date|aaj kaun sa din)\b', lower):
+        return {
+            "action": "date",
+            "fast_path": True,
+            "lang": lang,
+            "clean_query": clean,
+            "params": {},
+        }
+
+    # 12. Conversational fallback
+    return {
+        "action": "conversational_ai",
+        "fast_path": False,
+        "lang": lang,
+        "clean_query": clean,
+        "needs_llm": True,
+        "params": {},
+    }
+
+async def execute_voice_action(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Executes the validated voice action using native PC controls.
+    """
+    action = intent["action"]
+    lang = intent.get("lang", "english")
+    params = intent.get("params", {})
+    clean = intent.get("clean_query", "")
+
+    if "response_text" in intent:
+        return {
+            "handled": True,
+            "fast_path": intent.get("fast_path", True),
+            "response_text": intent["response_text"],
+            "action": action,
+            "lang": lang,
+            "stop_session": intent.get("stop_session", False),
+            "pause_session": intent.get("pause_session", False),
+            "data": intent.get("data"),
+        }
+
+    # Audio actions
+    if action == "volume_up":
+        res = change_volume("up", params.get("steps", 5))
+        resp = "Volume badha diya hai." if lang == "hinglish" else "Volume increased."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "volume_down":
+        res = change_volume("down", params.get("steps", 5))
+        resp = "Volume kam kar diya hai." if lang == "hinglish" else "Volume decreased."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "toggle_mute":
+        res = toggle_mute()
+        resp = "Audio mute toggle kar diya." if lang == "hinglish" else "Audio mute toggled."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "set_volume":
+        target_val = params.get("level", 50)
+        res = set_volume(target_val)
+        resp = f"Volume {target_val} percent par set kar diya." if lang == "hinglish" else f"Volume set to {target_val}%."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    # Native App Launchers
+    if action == "launch_camera":
+        res = launch_application("camera")
+        resp = "Camera khol diya hai." if lang == "hinglish" else "Opening your camera."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "launch_youtube":
+        res = launch_application("youtube")
+        resp = "YouTube open kar diya hai." if lang == "hinglish" else "Opening YouTube in your browser."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "launch_chrome":
+        res = launch_application("chrome")
+        resp = "Google Chrome khol diya hai." if lang == "hinglish" else "Opening Google Chrome."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "launch_vscode":
+        res = launch_application("code")
+        resp = "VS Code khol diya hai." if lang == "hinglish" else "Opening VS Code."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "launch_calculator":
+        res = launch_application("calculator")
+        resp = "Calculator khol diya hai." if lang == "hinglish" else "Opening Calculator."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "launch_notepad":
+        res = launch_application("notepad")
+        resp = "Notepad khol diya hai." if lang == "hinglish" else "Opening Notepad."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "launch_app":
+        app_target = params.get("app", "")
+        res = launch_application(app_target)
+        resp = f"{app_target.title()} khol diya hai." if lang == "hinglish" else f"Opening {app_target.title()}."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    if action == "close_app":
+        app_target = params.get("app", "")
+        res = close_application(app_target)
+        resp = f"{app_target.title()} band kar diya." if lang == "hinglish" else f"Closed {app_target.title()}."
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
+
+    # File Operations
+    if action == "find_resume":
         resumes = find_resume_files()
         if resumes:
             top_resume = resumes[0]
             open_file_path(top_resume["path"])
             resp = f"Aapka resume {top_resume['name']} mil gaya hai, maine isse open kar diya." if lang == "hinglish" else f"I found your resume, {top_resume['name']}, and opened it for you."
-            return {"handled": True, "fast_path": True, "response_text": resp, "action": "find_resume", "data": resumes, "lang": lang}
+            return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": resumes, "lang": lang}
         else:
             resp = "Maine aapke folders check kiye, lekin resume naam ki koi file nahi mili." if lang == "hinglish" else "I searched your Documents and Downloads, but couldn't find a resume file."
-            return {"handled": True, "fast_path": True, "response_text": resp, "action": "find_resume", "lang": lang}
+            return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "lang": lang}
 
-    if re.search(r'\b(open (?:my )?latest pdf|latest pdf kholo|latest document)\b', lower):
+    if action == "open_latest_pdf":
         latest = find_latest_file(".pdf")
         if latest:
             open_file_path(latest["path"])
             resp = f"Aapki latest PDF {latest['name']} open kar di hai." if lang == "hinglish" else f"Opening your most recent PDF: {latest['name']}."
-            return {"handled": True, "fast_path": True, "response_text": resp, "action": "open_latest_pdf", "data": latest, "lang": lang}
+            return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": latest, "lang": lang}
         else:
             resp = "Koi nayi PDF file nahi mili." if lang == "hinglish" else "I could not find any recent PDF files."
-            return {"handled": True, "fast_path": True, "response_text": resp, "action": "open_latest_pdf", "lang": lang}
+            return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "lang": lang}
 
-    if re.search(r'\b(open (?:my )?downloads(?: folder)?|downloads kholo)\b', lower):
+    if action == "open_downloads":
         res = launch_application("downloads")
         resp = "Downloads folder open kar diya hai." if lang == "hinglish" else "Opening your Downloads folder."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "open_downloads", "data": res, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
 
-    # 8. Real Web Search & Spoken Summarization
-    web_search_match = re.search(r'\b(?:search (?:the )?(?:internet|web) for|google|search for|find(?: the)? latest)\s+([a-zA-Z0-9_\- ]+)\b', lower)
-    if web_search_match and not re.search(r'\b(?:file|folder|document|pdf|resume)\b', lower):
-        search_query = web_search_match.group(1).strip()
+    # Web Search
+    if action == "web_search":
+        search_query = params.get("query", clean)
         search_web_in_browser(search_query)
-        
+        search_results = None
         try:
             from browser.engine import BrowserAgent
             browser = BrowserAgent()
             search_results = await browser.search(search_query, limit=3)
-            
-            if search_results:
-                snippets_text = " ".join([f"{r['title']}: {r['snippet']}" for r in search_results if r.get('snippet')])
-                snippets_text = re.sub(r'&[a-zA-Z0-9#]+;', ' ', snippets_text)[:400]
-                
-                summary_prompt = f"Live search results for '{search_query}': {snippets_text}. Summarize the core finding into ONE conversational spoken sentence for Kunal."
-                spoken_summary = await ask_voice_llm(summary_prompt, lang=lang)
-                resp = f"I searched the web for {search_query}. {spoken_summary}"
-                return {"handled": True, "fast_path": False, "response_text": resp, "action": "web_search_summary", "results": search_results, "query": search_query, "lang": lang}
-        except Exception as e:
-            print("Web search agent error:", e)
+        except Exception:
+            pass
+
+        if search_results:
+            snippets_text = " ".join([f"{r['title']}: {r['snippet']}" for r in search_results if r.get('snippet')])
+            snippets_text = re.sub(r'&[a-zA-Z0-9#]+;', ' ', snippets_text)[:400]
+            return {
+                "handled": True,
+                "fast_path": False,
+                "action": "web_search_summary",
+                "needs_summary": True,
+                "query": search_query,
+                "snippets": snippets_text,
+                "results": search_results,
+                "lang": lang,
+            }
 
         resp = f"Maine browser mein '{search_query}' search kar diya hai." if lang == "hinglish" else f"I have opened the web search for '{search_query}' in your browser."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "web_search", "query": search_query, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "query": search_query, "lang": lang}
 
-    # 9. Screenshots
-    if re.search(r'\b(take (?:a )?screenshot|capture screen|screen capture|screenshot lo|screenshot le lo)\b', lower):
+    # Screenshots
+    if action == "screenshot":
         res = capture_desktop_screenshot()
         if res.get("status") == "success":
             resp = "Desktop screenshot capture ho gaya hai." if lang == "hinglish" else "Desktop screenshot captured successfully."
         else:
             resp = "Screenshot capture mein dikkat aayi." if lang == "hinglish" else "Failed to capture desktop screenshot."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "screenshot", "data": res, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": res, "lang": lang}
 
-    # 10. Instant Battery & System Telemetry (<0.6ms via Win32 C API)
-    if re.search(r'\b(battery|charge|charging|battery kitni hai|battery status)\b', lower):
+    # Telemetry
+    if action == "battery_status":
         metrics = get_system_metrics()
         bp = metrics["metrics"].get("battery_percent", 90)
         resp = f"Aapki battery {bp}% hai." if lang == "hinglish" else f"Battery is currently at {bp}%."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "battery_status", "data": metrics, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": metrics, "lang": lang}
 
-    if re.search(r'\b(cpu usage|ram usage|system info|system status|performance|pc ka haal)\b', lower):
+    if action == "system_status":
         metrics = get_system_metrics()
         m = metrics["metrics"]
         resp = (
@@ -291,27 +585,46 @@ async def dispatch_voice_command(text: str) -> Dict[str, Any]:
             if lang == "hinglish" else
             f"RAM is at {m['ram_usage_percent']}% utilization with {m['free_ram_mb']} MB free."
         )
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "system_status", "data": metrics, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": metrics, "lang": lang}
 
-    # 11. Time & Date (<1ms)
-    if re.search(r'\b(what time is it|current time|kya samay hua|time batao|kitne baje hain)\b', lower):
+    # Time & Date
+    if action == "time":
         now = datetime.datetime.now()
         time_str = now.strftime("%I:%M %p")
         resp = f"Abhi samay {time_str} hua hai." if lang == "hinglish" else f"It is currently {time_str}."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "time", "data": {"time": time_str}, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": {"time": time_str}, "lang": lang}
 
-    if re.search(r'\b(today\'?s? date|what is today|aaj ki date|aaj kaun sa din)\b', lower):
+    if action == "date":
         now = datetime.datetime.now()
         date_str = now.strftime("%A, %B %d, %Y")
         resp = f"Aaj {date_str} hai." if lang == "hinglish" else f"Today is {date_str}."
-        return {"handled": True, "fast_path": True, "response_text": resp, "action": "date", "data": {"date": date_str}, "lang": lang}
+        return {"handled": True, "fast_path": True, "response_text": resp, "action": action, "data": {"date": date_str}, "lang": lang}
 
-    # 12. Fast Conversational LLM Fallback (max 30 tokens, 3.5s timeout)
-    llm_resp = await ask_voice_llm(clean, lang=lang)
+    # Conversational Fallback
     return {
-        "handled": True,
+        "handled": False,
         "fast_path": False,
-        "response_text": llm_resp,
         "action": "conversational_ai",
-        "lang": lang
+        "needs_llm": True,
+        "clean_query": clean,
+        "lang": lang,
     }
+
+async def dispatch_voice_command(
+    text: str,
+    conversation_id: Optional[int] = None,
+    turn_id: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Unified voice command router.
+    Routes execution through central KelaEngine to guarantee session persistence,
+    centralized tool risk policy, shared conversation memory, and deduplication.
+    """
+    from core.engine import kela_engine
+    return await kela_engine.process_voice_turn(
+        text=text,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        workspace_path=workspace_path,
+    )

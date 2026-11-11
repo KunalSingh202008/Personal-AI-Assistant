@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional, Dict, Any, List
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request, Security, Depends
@@ -1459,6 +1459,9 @@ class PCSearchRequest(BaseModel):
 
 class VoiceCommandRequest(BaseModel):
     text: str
+    conversation_id: Optional[int] = None
+    turn_id: Optional[str] = None
+    workspace_path: Optional[str] = None
 
 class VoiceSpeakRequest(BaseModel):
     text: str
@@ -1477,8 +1480,13 @@ async def voice_speak_endpoint(req: VoiceSpeakRequest):
 @app.post("/api/voice/command")
 @app.post("/api/voice/conversation")
 async def voice_command_endpoint(req: VoiceCommandRequest):
-    """Voice mode conversation & action dispatcher with spoken response generation."""
-    return await dispatch_voice_command(req.text)
+    """Voice mode conversation & action dispatcher routed through central KelaEngine."""
+    return await kela_engine.process_voice_turn(
+        text=req.text,
+        conversation_id=req.conversation_id,
+        turn_id=req.turn_id,
+        workspace_path=req.workspace_path,
+    )
 
 @app.post("/api/pc/launch", dependencies=[Security(require_local_auth)])
 async def pc_launch_endpoint(req: PCLaunchRequest):

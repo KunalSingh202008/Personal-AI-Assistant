@@ -81,6 +81,105 @@ class PCControlAndVoiceTests(unittest.TestCase):
         self.assertTrue(data2["handled"])
         self.assertIn("Kunal Singh", data2["response_text"])
 
+    def test_voice_unification_with_core_engine_and_persistence(self):
+        from core.conversation_manager import conversation_manager
+        resp = self.client.post("/api/voice/conversation", json={"text": "what time is it"})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["handled"])
+        self.assertIn("conversation_id", data)
+        conv_id = data["conversation_id"]
+        self.assertIsInstance(conv_id, int)
+
+        # Verify messages persisted to SQLite
+        messages = conversation_manager.get_messages(conv_id)
+        self.assertGreaterEqual(len(messages), 2)
+        user_msg = next((m for m in messages if m["role"] == "user"), None)
+        asst_msg = next((m for m in messages if m["role"] == "assistant"), None)
+        self.assertIsNotNone(user_msg)
+        self.assertIsNotNone(asst_msg)
+        self.assertEqual(user_msg["content"], "what time is it")
+        self.assertIn("It is currently", asst_msg["content"])
+
+    def test_voice_and_text_shared_session_history(self):
+        from core.conversation_manager import conversation_manager
+        # Create a conversation
+        conv = conversation_manager.create_conversation(title="Shared Text and Voice")
+        conv_id = conv["id"]
+
+        # Voice turn 1
+        resp1 = self.client.post(
+            "/api/voice/conversation",
+            json={"text": "who am i", "conversation_id": conv_id, "turn_id": "turn_voice_1"},
+        )
+        self.assertEqual(resp1.status_code, 200)
+        d1 = resp1.json()
+        self.assertEqual(d1["conversation_id"], conv_id)
+
+        # Voice turn 2 in same session
+        resp2 = self.client.post(
+            "/api/voice/conversation",
+            json={"text": "tell me about my projects", "conversation_id": conv_id, "turn_id": "turn_voice_2"},
+        )
+        self.assertEqual(resp2.status_code, 200)
+        d2 = resp2.json()
+        self.assertEqual(d2["conversation_id"], conv_id)
+
+        # Verify all turns exist in the shared SQLite session
+        messages = conversation_manager.get_messages(conv_id)
+        self.assertEqual(len(messages), 4)
+        roles = [m["role"] for m in messages]
+        self.assertEqual(roles, ["user", "assistant", "user", "assistant"])
+        self.assertEqual(messages[0]["content"], "who am i")
+        self.assertIn("Kunal Singh", messages[1]["content"])
+        self.assertEqual(messages[2]["content"], "tell me about my projects")
+        self.assertIn("Nexus AI", messages[3]["content"])
+
+    def test_voice_action_tool_risk_enforcement(self):
+        from core.tool_registry import tool_registry
+
+        # GREEN: Safe voice action is allowlisted
+        self.assertEqual(tool_registry.get_tool_risk("launch_calculator"), "GREEN")
+        self.assertEqual(tool_registry.get_tool_risk("time"), "GREEN")
+        self.assertEqual(tool_registry.get_tool_risk("battery_status"), "GREEN")
+        self.assertTrue(tool_registry.is_safe_voice_action("launch_calculator"))
+
+        # AMBER: Risky action requires approval
+        self.assertEqual(tool_registry.get_tool_risk("write_file"), "AMBER")
+        self.assertEqual(tool_registry.get_tool_risk("run_command"), "AMBER")
+
+        # RED: Destructive / unknown action is blocked
+        self.assertEqual(tool_registry.get_tool_risk("format_drive"), "RED")
+
+    def test_voice_turn_deduplication(self):
+        from core.conversation_manager import conversation_manager
+        conv = conversation_manager.create_conversation(title="Deduplication Test")
+        conv_id = conv["id"]
+        turn_id = "duplicate_turn_test_123"
+
+        # First execution succeeds
+        resp1 = self.client.post(
+            "/api/voice/conversation",
+            json={"text": "what time is it", "conversation_id": conv_id, "turn_id": turn_id},
+        )
+        self.assertEqual(resp1.status_code, 200)
+        d1 = resp1.json()
+        self.assertTrue(d1["handled"])
+
+        # Manually lock turn to simulate active concurrency
+        conversation_manager.acquire_turn_lock(conv_id, turn_id)
+        try:
+            resp2 = self.client.post(
+                "/api/voice/conversation",
+                json={"text": "what time is it", "conversation_id": conv_id, "turn_id": turn_id},
+            )
+            self.assertEqual(resp2.status_code, 200)
+            d2 = resp2.json()
+            self.assertFalse(d2["handled"])
+            self.assertEqual(d2.get("action"), "duplicate_suppressed")
+        finally:
+            conversation_manager.release_turn_lock(conv_id, turn_id)
+
     def test_unauthenticated_pc_endpoint_blocked(self):
         unauth_client = TestClient(app)
         resp = unauth_client.get("/api/pc/system")

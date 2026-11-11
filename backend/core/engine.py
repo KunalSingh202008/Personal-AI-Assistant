@@ -56,6 +56,18 @@ class KelaEngine:
             title = last_user_message[:40] or "New chat"
             conv_data = self.conversations.create_conversation(title=title)
             conversation_id = conv_data["id"]
+        else:
+            # If request only passed the latest message, load prior session history from SQLite
+            if len(messages) <= 1:
+                db_msgs = self.conversations.get_messages(conversation_id)
+                if db_msgs:
+                    history = []
+                    for dm in db_msgs:
+                        if dm.get("content") == last_user_message and dm.get("role") == "user":
+                            continue
+                        history.append({"role": dm["role"], "content": dm["content"]})
+                    history.append({"role": "user", "content": last_user_message})
+                    messages = history
 
         active_turn_id = turn_id or f"turn_{int(asyncio.get_event_loop().time() * 1000)}"
 
@@ -178,6 +190,234 @@ class KelaEngine:
         except Exception as e:
             logger.error("Engine execution failure: %s", e)
             yield ndjson({"error": f"Internal execution error: {str(e)}"})
+        finally:
+            self.conversations.release_turn_lock(conversation_id, active_turn_id)
+
+    async def process_voice_turn(
+        self,
+        text: str,
+        conversation_id: Optional[int] = None,
+        turn_id: Optional[str] = None,
+        workspace_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Unifies voice interaction with KELA's central engine, persistence,
+        permission management, tool risk checking, and provider fallback.
+        """
+        from voice.router import resolve_voice_intent, execute_voice_action, is_wake_word_present, detect_language
+
+        clean_text = text.strip()
+        _, stripped_query = is_wake_word_present(clean_text)
+        effective_query = stripped_query.strip() or clean_text
+
+        # 1. Resolve or create persistent conversation session in SQLite (Requirement 4)
+        if not conversation_id:
+            title = f"Voice: {effective_query[:30]}" if effective_query else "Voice Conversation"
+            conv_data = self.conversations.create_conversation(title=title)
+            conversation_id = conv_data["id"]
+        else:
+            existing = self.conversations.get_conversation(conversation_id)
+            if not existing:
+                title = f"Voice: {effective_query[:30]}" if effective_query else "Voice Conversation"
+                conv_data = self.conversations.create_conversation(title=title)
+                conversation_id = conv_data["id"]
+
+        active_turn_id = turn_id or f"voice_{int(asyncio.get_event_loop().time() * 1000)}"
+
+        # 2. Concurrency lock to prevent duplicate turn execution (Requirement 10)
+        if not self.conversations.acquire_turn_lock(conversation_id, active_turn_id):
+            logger.warning("Duplicate turn execution prevented: conv=%s, turn=%s", conversation_id, active_turn_id)
+            return {
+                "conversation_id": conversation_id,
+                "turn_id": active_turn_id,
+                "handled": False,
+                "error": "Duplicate turn execution prevented.",
+                "response_text": "",
+                "action": "duplicate_suppressed",
+            }
+
+        lang = detect_language(clean_text)
+
+        try:
+            # 3. Persist voice user message immediately to SQLite (Requirement 5)
+            if clean_text:
+                self.conversations.save_user_message(
+                    conversation_id=conversation_id,
+                    content=clean_text,
+                    client_message_id=active_turn_id,
+                )
+
+            # 4. Resolve voice intent
+            intent = resolve_voice_intent(clean_text)
+            action_name = intent["action"]
+            lang = intent.get("lang", lang)
+
+            # 5. Tool Registry Risk & Action Permission Check (Requirements 7 & 8)
+            risk = self.tools.get_tool_risk(action_name)
+            if risk == "RED":
+                refuse_text = (
+                    "Yeh operation voice mode mein allowed nahi hai."
+                    if lang == "hinglish"
+                    else f"The '{action_name}' operation is not permitted via voice."
+                )
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=refuse_text,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                return {
+                    "conversation_id": conversation_id,
+                    "turn_id": active_turn_id,
+                    "handled": False,
+                    "risk": risk,
+                    "response_text": refuse_text,
+                    "action": action_name,
+                    "lang": lang,
+                }
+            elif risk == "AMBER":
+                approval_text = (
+                    f"Operation '{action_name}' ke liye explicit approval ki zaroorat hai."
+                    if lang == "hinglish"
+                    else f"Operation '{action_name}' requires explicit approval in workspace."
+                )
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=approval_text,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                return {
+                    "conversation_id": conversation_id,
+                    "turn_id": active_turn_id,
+                    "handled": False,
+                    "risk": risk,
+                    "requires_approval": True,
+                    "response_text": approval_text,
+                    "action": action_name,
+                    "lang": lang,
+                }
+
+            # 6. Execute safe action or delegate to inference provider
+            exec_result = await execute_voice_action(intent)
+            response_text = exec_result.get("response_text", "")
+
+            if exec_result.get("needs_summary"):
+                # Summarize web search results using active inference provider
+                snippets = exec_result.get("snippets", "")
+                q = exec_result.get("query", "")
+                summary_prompt = (
+                    f"Live search results for '{q}': {snippets}. "
+                    "Summarize the core finding into ONE conversational spoken sentence for Kunal."
+                )
+                voice_system = (
+                    "You are KELA, an ultra-fast voice assistant for Kunal Singh. "
+                    "Answer in ONE short, natural spoken sentence (under 25 words). "
+                    "Never use markdown, lists, code, or quotes."
+                )
+                provider = self.providers.get_active_provider()
+                try:
+                    summary_resp = await asyncio.wait_for(
+                        provider.generate_chat(
+                            [
+                                {"role": "system", "content": voice_system},
+                                {"role": "user", "content": summary_prompt},
+                            ],
+                            options={"temperature": 0.4, "num_predict": 30},
+                        ),
+                        timeout=4.0,
+                    )
+                    cleaned = re.sub(r'[*_#`[\]()"\n]', ' ', summary_resp).strip()
+                    if cleaned:
+                        response_text = f"I searched the web for {q}. {cleaned}"
+                    else:
+                        response_text = f"I searched the web for {q} and opened the results in your browser."
+                except Exception as ex:
+                    logger.warning("Web search summary error: %s", ex)
+                    response_text = f"I searched the web for {q} and opened the results in your browser."
+
+            elif exec_result.get("needs_llm"):
+                # Conversational query with recent conversation context (Requirement 6)
+                voice_system = (
+                    "You are KELA, an ultra-fast voice assistant for Kunal Singh. "
+                    "Answer in ONE short, natural spoken sentence (under 25 words). "
+                    "Never use markdown, lists, code, or quotes."
+                )
+                past_messages = self.conversations.get_messages(conversation_id)
+                recent_history: List[Dict[str, str]] = []
+                for m in past_messages[-5:]:
+                    if m.get("content") == clean_text and m.get("role") == "user":
+                        continue
+                    recent_history.append({"role": m["role"], "content": m["content"]})
+
+                query_messages = [
+                    {"role": "system", "content": voice_system},
+                    *recent_history,
+                    {"role": "user", "content": effective_query or clean_text},
+                ]
+
+                provider = self.providers.get_active_provider()
+                try:
+                    llm_raw = await asyncio.wait_for(
+                        provider.generate_chat(
+                            query_messages,
+                            options={"temperature": 0.4, "num_predict": 30},
+                        ),
+                        timeout=4.0,
+                    )
+                    cleaned = re.sub(r'[*_#`[\]()"\n]', ' ', llm_raw).strip()
+                    if cleaned:
+                        response_text = cleaned
+                    else:
+                        response_text = (
+                            "Haan Kunal, main sun raha hoon. Kya karna hai?"
+                            if lang == "hinglish"
+                            else "I am right here with you, Kunal. How can I help next?"
+                        )
+                except Exception as ex:
+                    logger.warning("Voice LLM error: %s", ex)
+                    response_text = (
+                        "Haan Kunal, main sun raha hoon. Kya karna hai?"
+                        if lang == "hinglish"
+                        else "I am right here with you, Kunal. How can I help next?"
+                    )
+
+            # 7. Persist completed assistant response to SQLite (Requirement 5)
+            if response_text:
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=response_text,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+
+            # 8. Return response payload compatible with frontend contract
+            return {
+                "conversation_id": conversation_id,
+                "turn_id": active_turn_id,
+                "handled": exec_result.get("handled", True),
+                "fast_path": exec_result.get("fast_path", False),
+                "response_text": response_text,
+                "action": exec_result.get("action", action_name),
+                "lang": lang,
+                "stop_session": exec_result.get("stop_session", False),
+                "pause_session": exec_result.get("pause_session", False),
+                "data": exec_result.get("data"),
+            }
+
+        except Exception as err:
+            logger.error("Error in process_voice_turn: %s", err, exc_info=True)
+            fallback = (
+                "Kuch takleef aayi, kripya dobara boliye."
+                if lang == "hinglish"
+                else "Sorry, I encountered an internal error processing that voice command."
+            )
+            return {
+                "conversation_id": conversation_id,
+                "turn_id": active_turn_id,
+                "handled": False,
+                "error": str(err),
+                "response_text": fallback,
+                "action": "error",
+                "lang": lang,
+            }
         finally:
             self.conversations.release_turn_lock(conversation_id, active_turn_id)
 
