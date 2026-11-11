@@ -108,10 +108,31 @@ class PCControlAndVoiceTests(unittest.TestCase):
         self.assertIn("windows_sapi_available", data)
 
     def test_pc_launch_verification(self):
-        from pc_control.app_launcher import launch_application
+        from pc_control.app_launcher import launch_application, close_application
         res = launch_application("calc")
         self.assertEqual(res["status"], "success")
-        self.assertIn("verified", res)
+        self.assertTrue(res["verified"])
+        self.assertIn("pids", res)
+        # Cleanup
+        close_res = close_application("calc")
+        self.assertEqual(close_res["status"], "success")
+        self.assertTrue(close_res["verified"])
+
+    def test_pc_launch_timeout_and_actionable_error(self):
+        from pc_control.app_launcher import launch_application
+        res = launch_application("nonexistent_test_app_404", timeout_sec=0.5)
+        self.assertEqual(res["status"], "error")
+        self.assertFalse(res["verified"])
+        self.assertIn("process did not start within", res["message"])
+
+    def test_app_process_map_coverage(self):
+        from pc_control.app_launcher import APP_PROCESS_MAP
+        self.assertIn("calculator", APP_PROCESS_MAP)
+        self.assertIn("CalculatorApp.exe", APP_PROCESS_MAP["calculator"])
+        self.assertIn("camera", APP_PROCESS_MAP)
+        self.assertIn("WindowsCamera.exe", APP_PROCESS_MAP["camera"])
+        self.assertIn("chrome", APP_PROCESS_MAP)
+        self.assertIn("vscode", APP_PROCESS_MAP)
 
 if __name__ == "__main__":
     unittest.main()
