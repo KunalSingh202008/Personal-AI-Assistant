@@ -18,7 +18,8 @@ class PCControlAndVoiceTests(unittest.TestCase):
         cls.db_patch = patch.object(database, "DATABASE_PATH", cls.db_path)
         cls.db_patch.start()
         initialize_database()
-        cls.client = TestClient(app)
+        from core.permission_manager import permission_manager
+        cls.client = TestClient(app, headers={"X-KELA-Token": permission_manager.local_token})
 
     @classmethod
     def tearDownClass(cls):
@@ -79,6 +80,11 @@ class PCControlAndVoiceTests(unittest.TestCase):
         data2 = resp2.json()
         self.assertTrue(data2["handled"])
         self.assertIn("Kunal Singh", data2["response_text"])
+
+    def test_unauthenticated_pc_endpoint_blocked(self):
+        unauth_client = TestClient(app)
+        resp = unauth_client.get("/api/pc/system")
+        self.assertEqual(resp.status_code, 401)
 
     def test_pc_system_endpoint(self):
         resp = self.client.get("/api/pc/system")

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { getAuthHeaders } from "../auth";
 
 export type VoiceState =
   | "IDLE"
@@ -106,21 +107,25 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
 
   // Fetch initial system telemetry
   useEffect(() => {
-    fetch(`${apiUrl}/api/pc/system`)
-      .then((r) => r.json())
-      .then((data: { metrics?: { cpu_load_percent?: number; used_ram_mb?: number; free_ram_mb?: number; battery_percent?: number } }) => {
-        if (data?.metrics) {
-          setSystemMetrics({
-            cpu: data.metrics.cpu_load_percent,
-            ram_used: data.metrics.used_ram_mb,
-            ram_free: data.metrics.free_ram_mb,
-            battery: data.metrics.battery_percent,
-          });
+    void (async () => {
+      try {
+        const authHeaders = await getAuthHeaders(apiUrl);
+        const r = await fetch(`${apiUrl}/api/pc/system`, { headers: authHeaders });
+        if (r.ok) {
+          const data = (await r.json()) as { metrics?: { cpu_load_percent?: number; used_ram_mb?: number; free_ram_mb?: number; battery_percent?: number } };
+          if (data?.metrics) {
+            setSystemMetrics({
+              cpu: data.metrics.cpu_load_percent,
+              ram_used: data.metrics.used_ram_mb,
+              ram_free: data.metrics.free_ram_mb,
+              battery: data.metrics.battery_percent,
+            });
+          }
         }
-      })
-      .catch((err: unknown) => {
+      } catch (err: unknown) {
         console.debug("System metrics unavailable:", err);
-      });
+      }
+    })();
   }, [apiUrl]);
 
   // Release Audio Analyser resources safely

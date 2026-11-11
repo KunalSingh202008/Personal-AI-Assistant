@@ -12,10 +12,19 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+from core.permission_manager import (
+    permission_manager,
+    require_local_auth,
+    LOCAL_AGENT_TOKEN,
+)
+from core.provider_manager import provider_manager
+from core.conversation_manager import conversation_manager
+from core.engine import kela_engine
 
 from action_policy import action_digest, audit_target
 from agent import agent_stream, project_context_message
@@ -246,14 +255,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-    ],
+    allow_origins=permission_manager.allowed_origins,
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1):(?:517[5-9]|51[89]\d)",
     allow_credentials=True,
     allow_methods=["*"],
@@ -557,6 +559,59 @@ async def list_models():
 async def select_model(request: ModelSelectRequest):
     set_setting("selected_model", request.model)
     return {"selected_model": request.model}
+
+
+@app.get("/api/auth/local-token")
+async def get_local_token_route(request: Request):
+    """
+    Exposes local agent token to authenticated loopback frontend clients only.
+    Protected against DNS rebinding and cross-origin stealing.
+    """
+    host = request.headers.get("host", "")
+    if not permission_manager.validate_host(host):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Untrusted host header (anti-DNS rebinding).",
+        )
+
+    origin = request.headers.get("origin")
+    if origin and not permission_manager.validate_origin(origin):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Untrusted origin.",
+        )
+
+    client_ip = request.client.host if request.client else "unknown"
+    if client_ip not in ("127.0.0.1", "::1", "localhost", "testclient"):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Access restricted to loopback clients.",
+        )
+
+    return {"token": permission_manager.local_token}
+
+
+@app.get("/api/providers")
+async def get_providers_endpoint():
+    """Returns available providers, health status, and active provider."""
+    return await provider_manager.get_all_providers_status()
+
+
+class ProviderSelectRequest(BaseModel):
+    provider: str
+
+
+@app.post("/api/providers/select")
+async def select_provider_endpoint(req: ProviderSelectRequest):
+    """Switch active inference provider."""
+    valid = ["ollama", "cloud"]
+    if req.provider not in valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid provider. Choose from: {valid}",
+        )
+    provider_manager.active_provider_name = req.provider
+    return {"status": "success", "active_provider": req.provider}
 
 
 @app.get("/api/student/tasks")
@@ -1315,204 +1370,17 @@ async def chat(request: ChatRequest):
         request, last_user_message
     )
 
-    model_messages = [
-        message.model_dump() for message in request.messages
-    ]
-    
-    # Inject workspace context
-    project_context = read_workspace_context(_selected_workspace_path())
-    context_message = project_context_message(project_context)
-    if context_message:
-        model_messages.insert(0, context_message)
-
-    # Inject persistent user preferences if configured
-    user_prefs = MemoryManager.get_preferences()
-    if user_prefs:
-        pref_lines = [f"- {k}: {v}" for k, v in user_prefs.items()]
-        model_messages.insert(
-            0,
-            {
-                "role": "system",
-                "content": (
-                    "User persistent preferences for responses:\n"
-                    + "\n".join(pref_lines)
-                ),
-            },
-        )
-
-    current_model = _active_model()
-
-    async def generate():
-        assistant_parts = []
-
-        # The frontend can capture this event to remember the conversation.
-        yield ndjson({
-            "conversation_id": conversation_id,
-        })
-
-        def _add_evidence_msg(content: str):
-            if model_messages and model_messages[0].get("role") == "system":
-                model_messages.insert(1, {"role": "system", "content": content})
-            else:
-                model_messages.insert(0, {"role": "system", "content": content})
-
-        # 1. Automatic Live Web Browsing if user prompt contains URL
-        urls = re.findall(r"https?://[^\s<>\"']+", last_user_message)
-        if urls:
-            from browser.engine import BrowserAgent
-            browser = BrowserAgent()
-            for target_url in urls[:2]:
-                yield ndjson({"step": f"Browsing live website: {target_url}..."})
-                try:
-                    res = await browser.navigate(target_url)
-                    if res.get("success") and res.get("page"):
-                        page = res["page"]
-                        page_title = page.get("title", target_url)
-                        page_text = page.get("text_preview", "")
-                        yield ndjson({"step": f"Extracted content from '{page_title}' ({len(page_text)} chars)"})
-                        _add_evidence_msg(
-                            f"[Live Web Evidence from {target_url}]\n"
-                            f"Title: {page_title}\n"
-                            f"Description: {page.get('description', '')}\n"
-                            f"Extracted Page Content:\n{page_text[:7000]}\n"
-                            "Analyze and directly use this real-time webpage content to answer the user's questions in full detail."
-                        )
-                except Exception as exc:
-                    logger.warning("Auto-browse failed for %s: %s", target_url, exc)
-
-        # 2. Automatic Document Intelligence if user prompt references attachments
-        att_matches = re.findall(r"\[Referenced Attachments:\s*([^\]]+)\]", last_user_message)
-        if att_matches:
-            from documents.processor import process_document
-            storage_dir = Path(app.state.workspace) / ".nexus_uploads"
-            for att_line in att_matches:
-                file_names = [f.strip() for f in att_line.split(",") if f.strip()]
-                for fname in file_names:
-                    candidate_paths = [
-                        storage_dir / fname,
-                        Path(app.state.workspace) / fname,
-                        Path.home() / "Downloads" / fname,
-                    ]
-                    target_file = next((p for p in candidate_paths if p.is_file()), None)
-                    if target_file:
-                        try:
-                            doc_info = process_document(target_file)
-                            doc_content = doc_info.get("content", "")
-                            if doc_content:
-                                total_units = doc_info.get("total_slides", doc_info.get("total_pages", "structured"))
-                                yield ndjson({"step": f"Analyzed attachment '{fname}' ({total_units} sections)"})
-                                _add_evidence_msg(
-                                    f"[Document Intelligence - Content of Attached '{fname}']\n"
-                                    f"Type: {doc_info.get('document_type', 'document')}\n"
-                                    f"Content:\n{doc_content[:12000]}\n"
-                                    "Thoroughly analyze this attached document content to fulfill the user's instructions (e.g. pros and cons, summary, slide analysis, technical review)."
-                                )
-                        except Exception as exc:
-                            logger.warning("Failed to auto-process attachment %s: %s", fname, exc)
-
-        # 3. Nexus AI System Persona
-        _add_evidence_msg(
-            "You are Nexus AI, an autonomous Personal AI Operating System. "
-            "You have integrated live web browsing, document intelligence (PDF, PPTX, DOCX, XLSX), "
-            "local coding tools, and workspace execution. "
-            "Never say you cannot browse the internet or access documents when web evidence or document contents are provided. "
-            "Always deliver clear, structured, well-grounded, professional responses."
-        )
-
-        payload = {
-            "model": current_model,
-            "messages": model_messages,
-            "stream": True,
-            "options": {"num_ctx": 8192, "num_predict": 2048},
-        }
-
-        try:
-            timeout = httpx.Timeout(
-                connect=10.0,
-                read=300.0,
-                write=30.0,
-                pool=10.0,
-            )
-
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST",
-                    f"{OLLAMA_URL}/api/chat",
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
-
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            yield ndjson({
-                                "error": "Received invalid data from Ollama",
-                            })
-                            return
-
-                        if event.get("error"):
-                            yield ndjson({
-                                "error": str(event["error"]),
-                            })
-                            return
-
-                        content = event.get("message", {}).get(
-                            "content", ""
-                        )
-
-                        if content:
-                            assistant_parts.append(content)
-                            yield ndjson({"token": content})
-
-                        if event.get("done"):
-                            answer = "".join(assistant_parts)
-
-                            if answer:
-                                save_message(
-                                    conversation_id,
-                                    "assistant",
-                                    answer,
-                                    client_message_id=f"{turn_id}:assistant",
-                                )
-
-                            yield ndjson({
-                                "done": True,
-                                "model": current_model,
-                                "conversation_id": conversation_id,
-                            })
-                            return
-
-                    yield ndjson({
-                        "error": "Ollama ended the stream unexpectedly",
-                    })
-
-        except httpx.TimeoutException:
-            yield ndjson({
-                "error": "The model timed out. Try a shorter prompt.",
-            })
-        except httpx.HTTPStatusError as exc:
-            yield ndjson({
-                "error": (
-                    f"Ollama returned HTTP "
-                    f"{exc.response.status_code}. Check the local model service."
-                ),
-            })
-        except httpx.HTTPError:
-            yield ndjson({
-                "error": "Could not communicate with Ollama",
-            })
-        except ValueError:
-            yield ndjson({"error": "Could not save the completed response."})
-        except Exception:
-            logger.exception("Unexpected error while streaming a chat response.")
-            yield ndjson({"error": "Unexpected error while completing the response."})
+    workspace_path = _selected_workspace_path()
+    model = _active_model()
 
     return StreamingResponse(
-        generate(),
+        kela_engine.chat_stream(
+            messages=[m.model_dump() for m in request.messages],
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            workspace_path=str(workspace_path),
+            model=model,
+        ),
         media_type="application/x-ndjson",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -1601,7 +1469,7 @@ async def voice_hardware_endpoint():
     """Report hardware audio, STT, and TTS provider capabilities."""
     return speech_manager.get_hardware_status()
 
-@app.post("/api/voice/speak")
+@app.post("/api/voice/speak", dependencies=[Security(require_local_auth)])
 async def voice_speak_endpoint(req: VoiceSpeakRequest):
     """Local text-to-speech execution via native Windows SAPI."""
     return speech_manager.windows_tts.synthesize(req.text, req.voice)
@@ -1612,17 +1480,17 @@ async def voice_command_endpoint(req: VoiceCommandRequest):
     """Voice mode conversation & action dispatcher with spoken response generation."""
     return await dispatch_voice_command(req.text)
 
-@app.post("/api/pc/launch")
+@app.post("/api/pc/launch", dependencies=[Security(require_local_auth)])
 async def pc_launch_endpoint(req: PCLaunchRequest):
     """Launch a Windows application or URI."""
     return launch_application(req.app)
 
-@app.post("/api/pc/close")
+@app.post("/api/pc/close", dependencies=[Security(require_local_auth)])
 async def pc_close_endpoint(req: PCLaunchRequest):
     """Close a Windows application by name."""
     return close_application(req.app)
 
-@app.post("/api/pc/volume")
+@app.post("/api/pc/volume", dependencies=[Security(require_local_auth)])
 async def pc_volume_endpoint(req: PCVolumeRequest):
     """Adjust or mute Windows volume."""
     act = req.action.lower()
@@ -1637,17 +1505,17 @@ async def pc_volume_endpoint(req: PCVolumeRequest):
     else:
         raise HTTPException(status_code=400, detail="Invalid volume action")
 
-@app.get("/api/pc/system")
+@app.get("/api/pc/system", dependencies=[Security(require_local_auth)])
 async def pc_system_endpoint():
     """Get real-time CPU, RAM, and Battery diagnostics."""
     return get_system_metrics()
 
-@app.get("/api/pc/processes")
+@app.get("/api/pc/processes", dependencies=[Security(require_local_auth)])
 async def pc_processes_endpoint(limit: int = 20):
     """List top running processes by memory."""
     return list_running_processes(limit)
 
-@app.post("/api/pc/screenshot")
+@app.post("/api/pc/screenshot", dependencies=[Security(require_local_auth)])
 async def pc_screenshot_endpoint():
     """Capture a primary desktop screenshot."""
     res = capture_desktop_screenshot()
@@ -1655,7 +1523,7 @@ async def pc_screenshot_endpoint():
         raise HTTPException(status_code=500, detail=res.get("message", "Screenshot failed"))
     return res
 
-@app.post("/api/pc/search")
+@app.post("/api/pc/search", dependencies=[Security(require_local_auth)])
 async def pc_search_endpoint(req: PCSearchRequest):
     """Fast search for files in Documents, Downloads, and Desktop."""
     return search_user_files(req.query, req.max_results or 15)

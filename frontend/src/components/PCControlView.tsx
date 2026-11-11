@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { getAuthHeaders } from "../auth";
 
 interface PCControlViewProps {
   apiUrl: string;
@@ -36,7 +37,8 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
 
   const fetchSystemData = useCallback(async () => {
     try {
-      const sysRes = await fetch(`${apiUrl}/api/pc/system`);
+      const authHeaders = await getAuthHeaders(apiUrl);
+      const sysRes = await fetch(`${apiUrl}/api/pc/system`, { headers: authHeaders });
       if (sysRes.ok) {
         const sysData = (await sysRes.json()) as { metrics?: SystemMetrics };
         if (sysData.metrics) {
@@ -44,7 +46,7 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
         }
       }
 
-      const procRes = await fetch(`${apiUrl}/api/pc/processes?limit=12`);
+      const procRes = await fetch(`${apiUrl}/api/pc/processes?limit=12`, { headers: authHeaders });
       if (procRes.ok) {
         const procData = (await procRes.json()) as { processes?: ProcessItem[] };
         setProcesses(procData.processes || []);
@@ -78,9 +80,10 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
   const handleLaunch = async (app: string) => {
     setIsLoading(true);
     try {
+      const authHeaders = await getAuthHeaders(apiUrl);
       const res = await fetch(`${apiUrl}/api/pc/launch`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({ app }),
       });
       const data = (await res.json()) as { message?: string };
@@ -96,9 +99,10 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
   const handleClose = async (app: string) => {
     setIsLoading(true);
     try {
+      const authHeaders = await getAuthHeaders(apiUrl);
       const res = await fetch(`${apiUrl}/api/pc/close`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({ app }),
       });
       const data = (await res.json()) as { message?: string };
@@ -114,9 +118,10 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
 
   const handleVolume = async (action: string, level?: number) => {
     try {
+      const authHeaders = await getAuthHeaders(apiUrl);
       const res = await fetch(`${apiUrl}/api/pc/volume`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({ action, level }),
       });
       const data = (await res.json()) as { message?: string };
@@ -131,8 +136,10 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
     setIsLoading(true);
     setFeedback("Capturing desktop screenshot...");
     try {
+      const authHeaders = await getAuthHeaders(apiUrl);
       const res = await fetch(`${apiUrl}/api/pc/screenshot`, {
         method: "POST",
+        headers: authHeaders,
       });
       if (!res.ok) throw new Error("Screenshot capture failed");
       const data = (await res.json()) as { base64: string; file_path: string; size_bytes: number };
@@ -151,9 +158,10 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
     if (!searchQuery.trim()) return;
     setIsLoading(true);
     try {
+      const authHeaders = await getAuthHeaders(apiUrl);
       const res = await fetch(`${apiUrl}/api/pc/search`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({ query: searchQuery }),
       });
       const data = (await res.json()) as { results?: FileSearchResultItem[] };

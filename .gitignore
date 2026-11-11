@@ -53,6 +53,8 @@ pnpm-debug.log*
 .env.*.local
 *.pem
 *.key
+*.token
+.kela_local_token
 
 # Editor & OS files
 .vscode/*
