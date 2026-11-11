@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
 export type VoiceState =
   | "IDLE"
@@ -9,13 +9,52 @@ export type VoiceState =
   | "EXECUTING"
   | "SPEAKING"
   | "INTERRUPTED"
-  | "PAUSED"
-  | "STOPPED"
-  | "ERROR";
+  | "STOPPED";
 
 interface VoiceAssistantProps {
   apiUrl: string;
   onSwitchToTextChat?: () => void;
+}
+
+interface SpeechRecognitionResultItem {
+  transcript: string;
+}
+
+interface SpeechRecognitionResult {
+  isFinal: boolean;
+  [index: number]: SpeechRecognitionResultItem;
+}
+
+interface SpeechRecognitionResultList {
+  length: number;
+  [index: number]: SpeechRecognitionResult;
+}
+
+interface SpeechRecognitionEvent {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface ISpeechRecognition {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives: number;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+  onstart: (() => void) | null;
+  onspeechstart: (() => void) | null;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+}
+
+interface ExtendedWindow extends Window {
+  SpeechRecognition?: new () => ISpeechRecognition;
+  webkitSpeechRecognition?: new () => ISpeechRecognition;
+  AudioContext?: typeof AudioContext;
+  webkitAudioContext?: typeof AudioContext;
 }
 
 export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssistantProps) {
@@ -34,20 +73,27 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
   const [sessionLogs, setSessionLogs] = useState<Array<{ id: string; sender: "user" | "kela"; text: string; time: string }>>([]);
 
   // Audio & Speech References
-  const recognitionRef = useRef<any>(null);
+  const recognitionRef = useRef<ISpeechRecognition | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  const silenceTimerRef = useRef<any>(null);
-  const ttsSafetyTimerRef = useRef<any>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ttsSafetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const transcriptBufferRef = useRef<string>("");
   const stateRef = useRef<VoiceState>("IDLE");
   const isSpeakingRef = useRef<boolean>(false);
   const isProcessingRef = useRef<boolean>(false);
   const isSessionActiveRef = useRef<boolean>(false);
+
+  // Ref bridges to break circular callback dependencies
+  const triggerBargeInRef = useRef<() => void>(() => { /* bridge */ });
+  const resumeListeningRef = useRef<() => void>(() => { /* bridge */ });
+  const stopVoiceSessionRef = useRef<() => void>(() => { /* bridge */ });
+  const processVoiceUtteranceRef = useRef<(text: string) => Promise<void>>(async () => { /* bridge */ });
+  const speakVoiceResponseRef = useRef<(text: string, lang?: string, shouldStopSession?: boolean) => void>(() => { /* bridge */ });
 
   // Sync refs with state
   useEffect(() => {
@@ -62,7 +108,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
   useEffect(() => {
     fetch(`${apiUrl}/api/pc/system`)
       .then((r) => r.json())
-      .then((data) => {
+      .then((data: { metrics?: { cpu_load_percent?: number; used_ram_mb?: number; free_ram_mb?: number; battery_percent?: number } }) => {
         if (data?.metrics) {
           setSystemMetrics({
             cpu: data.metrics.cpu_load_percent,
@@ -72,18 +118,108 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
           });
         }
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        console.debug("System metrics unavailable:", err);
+      });
   }, [apiUrl]);
+
+  // Release Audio Analyser resources safely
+  const releaseAudioAnalyser = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+      try {
+        void audioContextRef.current.close();
+      } catch (err: unknown) {
+        console.debug("AudioContext close error:", err);
+      }
+      audioContextRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+  }, []);
+
+  // Stop Voice Session
+  const stopVoiceSession = useCallback(() => {
+    setIsSessionActive(false);
+    isSessionActiveRef.current = false;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (ttsSafetyTimerRef.current) {
+      clearTimeout(ttsSafetyTimerRef.current);
+      ttsSafetyTimerRef.current = null;
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch {
+        // intentional no-op on abort
+      }
+      recognitionRef.current = null;
+    }
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    releaseAudioAnalyser();
+    setState("STOPPED");
+    setSpokenStatusText("Voice session ended. Click Start to resume.");
+    setLiveTranscript("");
+  }, [releaseAudioAnalyser]);
+
+  useEffect(() => {
+    stopVoiceSessionRef.current = stopVoiceSession;
+  }, [stopVoiceSession]);
+
+  // Instant Barge-In / Interruption
+  const triggerBargeIn = useCallback(() => {
+    if (ttsSafetyTimerRef.current) {
+      clearTimeout(ttsSafetyTimerRef.current);
+      ttsSafetyTimerRef.current = null;
+    }
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    isSpeakingRef.current = false;
+    isProcessingRef.current = false;
+    setState("INTERRUPTED");
+    setSpokenStatusText("I'm listening...");
+
+    setTimeout(() => {
+      if (isSessionActiveRef.current) {
+        resumeListeningRef.current();
+      } else {
+        setState("IDLE");
+      }
+    }, 150);
+  }, []);
+
+  useEffect(() => {
+    triggerBargeInRef.current = triggerBargeIn;
+  }, [triggerBargeIn]);
 
   // Setup Web Audio Analyser with Real-time Echo Cancellation
   const initAudioAnalyser = useCallback(async () => {
     try {
+      const extWin = window as ExtendedWindow;
       if (!audioContextRef.current) {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const AudioContextClass = extWin.AudioContext || extWin.webkitAudioContext || window.AudioContext;
         audioContextRef.current = new AudioContextClass();
       }
-      if (audioContextRef.current.state === "suspended") {
-        await audioContextRef.current.resume();
+      const audioCtx = audioContextRef.current;
+      if (!audioCtx) return;
+
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
       }
 
       if (!mediaStreamRef.current) {
@@ -96,8 +232,10 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
         });
       }
 
-      const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
-      const analyser = audioContextRef.current.createAnalyser();
+      if (!mediaStreamRef.current) return;
+
+      const source = audioCtx.createMediaStreamSource(mediaStreamRef.current);
+      const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
       analyserRef.current = analyser;
@@ -116,7 +254,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        // Active Barge-in check: If user speaks loudly while KELA is talking, cut speech immediately
+        // Active Barge-in check: If user speaks while KELA is talking, interrupt immediately
         if (isSpeakingRef.current) {
           let energySum = 0;
           for (let i = 0; i < bufferLength; i++) {
@@ -124,7 +262,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
           }
           const avgEnergy = energySum / bufferLength;
           if (avgEnergy > 60) {
-            triggerBargeIn();
+            triggerBargeInRef.current();
             return;
           }
         }
@@ -138,47 +276,32 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
           const grad = ctx.createLinearGradient(0, canvas.height, 0, 0);
           if (stateRef.current === "LISTENING" || stateRef.current === "SPEECH_DETECTED") {
             grad.addColorStop(0, "#00ff88");
-            grad.addColorStop(1, "#00f0ff");
+            grad.addColorStop(1, "#00b4d8");
           } else if (stateRef.current === "SPEAKING") {
-            grad.addColorStop(0, "#ffd700");
-            grad.addColorStop(1, "#ff8800");
+            grad.addColorStop(0, "#8a2be2");
+            grad.addColorStop(1, "#ff007f");
           } else {
-            grad.addColorStop(0, "#00f0ff");
-            grad.addColorStop(1, "#7928ca");
+            grad.addColorStop(0, "rgba(255,255,255,0.2)");
+            grad.addColorStop(1, "rgba(255,255,255,0.05)");
           }
 
           ctx.fillStyle = grad;
-          ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
-          x += barWidth + 2;
+          ctx.fillRect(x, canvas.height - barHeight, barWidth - 1, barHeight);
+          x += barWidth + 1;
         }
       };
 
       drawWave();
-    } catch (err) {
-      console.warn("Waveform capture init failed:", err);
-    }
-  }, []);
-
-  const releaseAudioAnalyser = useCallback(() => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    if (canvasRef.current) {
-      const ctx = canvasRef.current.getContext("2d");
-      if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
+    } catch (err: unknown) {
+      console.warn("Audio analyser unavailable:", err);
     }
   }, []);
 
   // Natural Spoken Speech (Text-To-Speech) with Fast Recovery
   const speakVoiceResponse = useCallback((text: string, lang = "english", shouldStopSession = false) => {
     if (!("speechSynthesis" in window)) {
-      if (shouldStopSession) stopVoiceSession();
-      else resumeListening();
+      if (shouldStopSession) stopVoiceSessionRef.current();
+      else resumeListeningRef.current();
       return;
     }
 
@@ -198,8 +321,8 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       .trim();
 
     if (!cleanSpeech) {
-      if (shouldStopSession) stopVoiceSession();
-      else resumeListening();
+      if (shouldStopSession) stopVoiceSessionRef.current();
+      else resumeListeningRef.current();
       return;
     }
 
@@ -241,10 +364,10 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       ]);
 
       if (shouldStopSession) {
-        stopVoiceSession();
+        stopVoiceSessionRef.current();
       } else if (isSessionActiveRef.current) {
         // AUTOMATICALLY RESUME LISTENING IMMEDIATELY!
-        resumeListening();
+        resumeListeningRef.current();
       } else {
         setState("IDLE");
       }
@@ -258,7 +381,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
     utterance.onend = onSpeechFinished;
     utterance.onerror = onSpeechFinished;
 
-    // Safety timeout: prevents Chrome's speech engine from ever locking up the assistant
+    // Safety timeout: prevents Chrome's speech engine from locking up the assistant
     const estimatedDurationMs = Math.max(2500, cleanSpeech.length * 80);
     ttsSafetyTimerRef.current = setTimeout(() => {
       if (isSpeakingRef.current) {
@@ -271,32 +394,9 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
     window.speechSynthesis.speak(utterance);
   }, []);
 
-  // Instant Barge-In / Interruption
-  const triggerBargeIn = useCallback(() => {
-    if (ttsSafetyTimerRef.current) {
-      clearTimeout(ttsSafetyTimerRef.current);
-      ttsSafetyTimerRef.current = null;
-    }
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    isSpeakingRef.current = false;
-    isProcessingRef.current = false;
-    setState("INTERRUPTED");
-    setSpokenStatusText("I'm listening...");
-
-    setTimeout(() => {
-      if (isSessionActiveRef.current) {
-        resumeListening();
-      } else {
-        setState("IDLE");
-      }
-    }, 150);
-  }, []);
+  useEffect(() => {
+    speakVoiceResponseRef.current = speakVoiceResponse;
+  }, [speakVoiceResponse]);
 
   // Process Completed Voice Utterance (Autonomous Backend Pipeline)
   const processVoiceUtterance = useCallback(
@@ -309,11 +409,9 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
         silenceTimerRef.current = null;
       }
 
-      // 1. Instant transition to PROCESSING
       isProcessingRef.current = true;
       setState("PROCESSING");
-      setLiveTranscript("");
-      setSpokenStatusText(`Processing: "${utteranceText}"`);
+      setLiveTranscript(utteranceText);
 
       const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       setSessionLogs((prev) => [
@@ -321,14 +419,15 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
         { id: String(Date.now()), sender: "user", text: utteranceText, time: timeStr },
       ]);
 
-      // 2. Pause speech recognition capture during processing
+      // Stop speech recognizer temporarily during processing & speaking
       if (recognitionRef.current) {
         try {
-          recognitionRef.current.stop();
-        } catch {}
+          recognitionRef.current.abort();
+        } catch {
+          // intentional no-op
+        }
       }
 
-      // 3. Dispatch to Unified KELA Voice Backend
       abortControllerRef.current = new AbortController();
 
       try {
@@ -343,65 +442,82 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
           throw new Error(`Server returned HTTP ${response.status}`);
         }
 
-        const result = await response.json();
-        isProcessingRef.current = false;
+        const data = (await response.json()) as {
+          response_text?: string;
+          action?: string;
+          lang?: string;
+          fast_path?: boolean;
+        };
 
-        // Visual flash for tool execution
-        if (result.action && !["greeting", "identity", "conversational_ai"].includes(result.action)) {
-          setState("EXECUTING");
-          setSpokenStatusText(`Executing: ${result.action}`);
-          await new Promise((r) => setTimeout(r, 180));
+        const spokenAnswer = data.response_text || "I have completed the task.";
+        const lang = data.lang || "english";
+        const isStopAction = data.action === "stop_listening";
+
+        setState("EXECUTING");
+        setSpokenStatusText(spokenAnswer);
+
+        // Speak response aloud through SpeechSynthesis
+        speakVoiceResponseRef.current(spokenAnswer, lang, isStopAction);
+      } catch (err: unknown) {
+        if (err instanceof Error && err.name === "AbortError") {
+          console.log("Voice request aborted by user.");
+          return;
         }
-
-        // 4. Speak response aloud immediately!
-        const responseText = result.response_text || "Done, Kunal.";
-        speakVoiceResponse(responseText, result.lang || "english", Boolean(result.stop_session));
-      } catch (err: any) {
+        console.error("Voice process error:", err);
+        const fallbackMsg = "Sorry, I had trouble reaching the server. Please try again.";
+        setSpokenStatusText(fallbackMsg);
+        speakVoiceResponseRef.current(fallbackMsg, "english", false);
+      } finally {
         isProcessingRef.current = false;
-        if (err.name === "AbortError") return;
-        console.error("Voice processing error:", err);
-        const errMsg = "I had trouble processing that command.";
-        setState("ERROR");
-        speakVoiceResponse(errMsg, "english", false);
+        abortControllerRef.current = null;
       }
     },
-    [apiUrl, speakVoiceResponse]
+    [apiUrl]
   );
 
-  // Resume / Start Speech Recognition with Zero-Delay Finalizer
+  useEffect(() => {
+    processVoiceUtteranceRef.current = processVoiceUtterance;
+  }, [processVoiceUtterance]);
+
+  // Resume continuous listening loop
   const resumeListening = useCallback(() => {
-    if (!isSessionActiveRef.current || isSpeakingRef.current || isProcessingRef.current) return;
+    if (!isSessionActiveRef.current) return;
+    if (isSpeakingRef.current || isProcessingRef.current) return;
 
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    setState("LISTENING");
+    setLiveTranscript("");
+    transcriptBufferRef.current = "";
 
-    if (!SpeechRecognition) {
-      alert("Speech recognition is not supported in this browser. Please use Google Chrome or Microsoft Edge.");
-      setState("ERROR");
+    const extWin = window as ExtendedWindow;
+    const SpeechRecClass = extWin.SpeechRecognition || extWin.webkitSpeechRecognition;
+    if (!SpeechRecClass) {
+      setSpokenStatusText("Speech recognition not supported in this browser. Please use Chrome or Edge.");
       return;
     }
 
     if (recognitionRef.current) {
       try {
         recognitionRef.current.abort();
-      } catch {}
+      } catch {
+        // intentional no-op
+      }
     }
 
-    const recognition = new SpeechRecognition();
+    const recognition = new SpeechRecClass();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = "en-IN"; // Indian English & Hinglish support
+    recognition.lang = "en-IN";
+    recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
       setState("LISTENING");
-      setSpokenStatusText("Listening to you...");
     };
 
     recognition.onspeechstart = () => {
       setState("SPEECH_DETECTED");
     };
 
-    recognition.onresult = (event: any) => {
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
       if (isSpeakingRef.current || isProcessingRef.current) return;
 
       let interim = "";
@@ -423,7 +539,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
           silenceTimerRef.current = null;
         }
         transcriptBufferRef.current = "";
-        processVoiceUtterance(finalStr.trim());
+        void processVoiceUtteranceRef.current(finalStr.trim());
         return;
       }
 
@@ -442,13 +558,13 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
           const textToSubmit = transcriptBufferRef.current;
           transcriptBufferRef.current = "";
           if (textToSubmit && !isProcessingRef.current && !isSpeakingRef.current) {
-            processVoiceUtterance(textToSubmit);
+            void processVoiceUtteranceRef.current(textToSubmit);
           }
         }, 650);
       }
     };
 
-    recognition.onerror = (event: any) => {
+    recognition.onerror = (event: { error: string }) => {
       if (event.error === "no-speech") return;
       console.warn("Speech recognition notice:", event.error);
     };
@@ -457,53 +573,32 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
         try {
           recognition.start();
-        } catch {}
+        } catch {
+          // intentional no-op
+        }
       }
     };
 
     recognitionRef.current = recognition;
     try {
       recognition.start();
-    } catch (e) {
+    } catch (e: unknown) {
       console.warn("Recognition start issue:", e);
     }
-  }, [processVoiceUtterance]);
+  }, []);
+
+  useEffect(() => {
+    resumeListeningRef.current = resumeListening;
+  }, [resumeListening]);
 
   // Start Voice Session
   const startVoiceSession = useCallback(async () => {
     setIsSessionActive(true);
     isSessionActiveRef.current = true;
     await initAudioAnalyser();
-    resumeListening();
+    resumeListeningRef.current();
     setSpokenStatusText("Listening to you...");
-  }, [initAudioAnalyser, resumeListening]);
-
-  // Stop Voice Session
-  const stopVoiceSession = useCallback(() => {
-    setIsSessionActive(false);
-    isSessionActiveRef.current = false;
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    if (ttsSafetyTimerRef.current) {
-      clearTimeout(ttsSafetyTimerRef.current);
-      ttsSafetyTimerRef.current = null;
-    }
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch {}
-      recognitionRef.current = null;
-    }
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-    releaseAudioAnalyser();
-    setState("STOPPED");
-    setSpokenStatusText("Voice session ended. Click Start to resume.");
-    setLiveTranscript("");
-  }, [releaseAudioAnalyser]);
+  }, [initAudioAnalyser]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -513,7 +608,9 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
-        } catch {}
+        } catch {
+          // intentional no-op
+        }
       }
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
       releaseAudioAnalyser();
@@ -552,7 +649,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       <div className="orb-stage">
         <div
           className={`kela-orb ${state.toLowerCase()}`}
-          onClick={state === "SPEAKING" ? triggerBargeIn : isSessionActive ? stopVoiceSession : startVoiceSession}
+          onClick={state === "SPEAKING" ? triggerBargeIn : isSessionActive ? stopVoiceSession : () => { void startVoiceSession(); }}
           title={state === "SPEAKING" ? "Click to interrupt speech" : isSessionActive ? "Click to pause" : "Click to start voice"}
         >
           <div className="orb-core"></div>
@@ -592,7 +689,7 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       {/* Master Session Controls */}
       <div className="voice-controls-bar">
         {!isSessionActive ? (
-          <button className="mic-primary-btn active" onClick={startVoiceSession}>
+          <button className="mic-primary-btn active" onClick={() => { void startVoiceSession(); }}>
             ▶ Start Voice Conversation
           </button>
         ) : (
@@ -633,15 +730,15 @@ export default function VoiceAssistant({ apiUrl, onSwitchToTextChat }: VoiceAssi
       {/* Fast Voice Command Examples */}
       <div className="quick-actions-tray">
         <span className="quick-label">Try Speaking:</span>
-        <button onClick={() => processVoiceUtterance("open chrome")}>"Open Chrome"</button>
-        <button onClick={() => processVoiceUtterance("open camera")}>"Open Camera"</button>
-        <button onClick={() => processVoiceUtterance("open calculator")}>"Open Calculator"</button>
-        <button onClick={() => processVoiceUtterance("who am i")}>"Who am I?"</button>
-        <button onClick={() => processVoiceUtterance("battery kitni hai")}>"Battery kitni hai?"</button>
-        <button onClick={() => processVoiceUtterance("volume up")}>"Volume up"</button>
-        <button onClick={() => processVoiceUtterance("open my latest pdf")}>"Open my latest PDF"</button>
-        <button onClick={() => processVoiceUtterance("search for AI internships")}>"Search for AI internships"</button>
-        <button onClick={() => processVoiceUtterance("stop listening")}>"Stop listening"</button>
+        <button onClick={() => { void processVoiceUtterance("open chrome"); }}>"Open Chrome"</button>
+        <button onClick={() => { void processVoiceUtterance("open camera"); }}>"Open Camera"</button>
+        <button onClick={() => { void processVoiceUtterance("open calculator"); }}>"Open Calculator"</button>
+        <button onClick={() => { void processVoiceUtterance("who am i"); }}>"Who am I?"</button>
+        <button onClick={() => { void processVoiceUtterance("battery kitni hai"); }}>"Battery kitni hai?"</button>
+        <button onClick={() => { void processVoiceUtterance("volume up"); }}>"Volume up"</button>
+        <button onClick={() => { void processVoiceUtterance("open my latest pdf"); }}>"Open my latest PDF"</button>
+        <button onClick={() => { void processVoiceUtterance("search for AI internships"); }}>"Search for AI internships"</button>
+        <button onClick={() => { void processVoiceUtterance("stop listening"); }}>"Stop listening"</button>
       </div>
 
       {/* Optional Collapsible Activity Log */}

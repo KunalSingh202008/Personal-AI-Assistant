@@ -100,5 +100,18 @@ class PCControlAndVoiceTests(unittest.TestCase):
         data = resp.json()
         self.assertEqual(data["status"], "success")
 
+    def test_voice_hardware_endpoint(self):
+        resp = self.client.get("/api/voice/hardware")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data.get("browser_web_speech"))
+        self.assertIn("windows_sapi_available", data)
+
+    def test_pc_launch_verification(self):
+        from pc_control.app_launcher import launch_application
+        res = launch_application("calc")
+        self.assertEqual(res["status"], "success")
+        self.assertIn("verified", res)
+
 if __name__ == "__main__":
     unittest.main()

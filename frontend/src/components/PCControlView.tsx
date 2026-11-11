@@ -1,41 +1,79 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 
 interface PCControlViewProps {
   apiUrl: string;
 }
 
+interface SystemMetrics {
+  cpu_load_percent?: number;
+  ram_usage_percent?: number;
+  used_ram_mb?: number;
+  free_ram_mb?: number;
+  battery_percent?: number | null;
+  battery_status?: number | null;
+}
+
+interface ProcessItem {
+  ProcessName: string;
+  MemoryMB: number;
+}
+
+interface FileSearchResultItem {
+  name: string;
+  folder: string;
+  size_bytes: number;
+  path: string;
+}
+
 export default function PCControlView({ apiUrl }: PCControlViewProps) {
-  const [metrics, setMetrics] = useState<any>(null);
-  const [processes, setProcesses] = useState<any[]>([]);
+  const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
+  const [processes, setProcesses] = useState<ProcessItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<FileSearchResultItem[]>([]);
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
 
-  const fetchSystemData = async () => {
+  const fetchSystemData = useCallback(async () => {
     try {
       const sysRes = await fetch(`${apiUrl}/api/pc/system`);
       if (sysRes.ok) {
-        const sysData = await sysRes.json();
-        setMetrics(sysData.metrics);
+        const sysData = (await sysRes.json()) as { metrics?: SystemMetrics };
+        if (sysData.metrics) {
+          setMetrics(sysData.metrics);
+        }
       }
 
       const procRes = await fetch(`${apiUrl}/api/pc/processes?limit=12`);
       if (procRes.ok) {
-        const procData = await procRes.json();
+        const procData = (await procRes.json()) as { processes?: ProcessItem[] };
         setProcesses(procData.processes || []);
       }
-    } catch (e) {
+    } catch (e: unknown) {
       console.warn("Failed to fetch system data:", e);
     }
-  };
+  }, [apiUrl]);
 
   useEffect(() => {
-    fetchSystemData();
-    const interval = setInterval(fetchSystemData, 10000);
-    return () => clearInterval(interval);
-  }, [apiUrl]);
+    let isMounted = true;
+    const runInitialFetch = async () => {
+      if (isMounted) {
+        await fetchSystemData();
+      }
+    };
+    runInitialFetch();
+
+    const interval = setInterval(() => {
+      if (isMounted) {
+        void fetchSystemData();
+      }
+    }, 10000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [fetchSystemData]);
 
   const handleLaunch = async (app: string) => {
     setIsLoading(true);
@@ -45,10 +83,11 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ app }),
       });
-      const data = await res.json();
+      const data = (await res.json()) as { message?: string };
       setFeedback(data.message || `Launched ${app}`);
-    } catch (e: any) {
-      setFeedback(`Error: ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFeedback(`Error: ${msg}`);
     } finally {
       setIsLoading(false);
     }
@@ -62,11 +101,12 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ app }),
       });
-      const data = await res.json();
+      const data = (await res.json()) as { message?: string };
       setFeedback(data.message || `Closed ${app}`);
-      fetchSystemData();
-    } catch (e: any) {
-      setFeedback(`Error: ${e.message}`);
+      void fetchSystemData();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFeedback(`Error: ${msg}`);
     } finally {
       setIsLoading(false);
     }
@@ -79,10 +119,11 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, level }),
       });
-      const data = await res.json();
+      const data = (await res.json()) as { message?: string };
       setFeedback(data.message || `Volume action: ${action}`);
-    } catch (e: any) {
-      setFeedback(`Volume Error: ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFeedback(`Volume Error: ${msg}`);
     }
   };
 
@@ -94,11 +135,12 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
         method: "POST",
       });
       if (!res.ok) throw new Error("Screenshot capture failed");
-      const data = await res.json();
+      const data = (await res.json()) as { base64: string; file_path: string; size_bytes: number };
       setScreenshotPreview(data.base64);
       setFeedback(`Screenshot saved to ${data.file_path} (${Math.round(data.size_bytes / 1024)} KB)`);
-    } catch (e: any) {
-      setFeedback(`Screenshot Error: ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFeedback(`Screenshot Error: ${msg}`);
     } finally {
       setIsLoading(false);
     }
@@ -114,11 +156,12 @@ export default function PCControlView({ apiUrl }: PCControlViewProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: searchQuery }),
       });
-      const data = await res.json();
+      const data = (await res.json()) as { results?: FileSearchResultItem[] };
       setSearchResults(data.results || []);
       setFeedback(`Found ${data.results?.length || 0} files matching '${searchQuery}'`);
-    } catch (e: any) {
-      setFeedback(`Search Error: ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFeedback(`Search Error: ${msg}`);
     } finally {
       setIsLoading(false);
     }

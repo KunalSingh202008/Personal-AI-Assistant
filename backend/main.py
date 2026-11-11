@@ -61,6 +61,8 @@ from pc_control import (
     search_user_files,
 )
 from voice.router import dispatch_voice_command
+from voice.providers import SpeechManager
+speech_manager = SpeechManager()
 from research.agent import research_stream
 from browser.engine import BrowserAgent
 from documents.processor import process_document
@@ -1589,6 +1591,20 @@ class PCSearchRequest(BaseModel):
 
 class VoiceCommandRequest(BaseModel):
     text: str
+
+class VoiceSpeakRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+
+@app.get("/api/voice/hardware")
+async def voice_hardware_endpoint():
+    """Report hardware audio, STT, and TTS provider capabilities."""
+    return speech_manager.get_hardware_status()
+
+@app.post("/api/voice/speak")
+async def voice_speak_endpoint(req: VoiceSpeakRequest):
+    """Local text-to-speech execution via native Windows SAPI."""
+    return speech_manager.windows_tts.synthesize(req.text, req.voice)
 
 @app.post("/api/voice/command")
 @app.post("/api/voice/conversation")
