@@ -146,6 +146,32 @@ def initialize_database():
 
         # Knowledge Engine tables
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_bases (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                owner_project TEXT NOT NULL DEFAULT 'default',
+                embedding_model TEXT NOT NULL DEFAULT 'local-fast',
+                embedding_dim INTEGER NOT NULL DEFAULT 128,
+                status TEXT NOT NULL DEFAULT 'ready',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Ensure default knowledge base exists
+        connection.execute("""
+            INSERT OR IGNORE INTO knowledge_bases (
+                id, name, description, owner_project, embedding_model, embedding_dim, status
+            )
+            VALUES (
+                'default', 'Personal Knowledge Base',
+                'Default local knowledge repository for documents and notes',
+                'personal', 'local-fast', 128, 'ready'
+            )
+        """)
+
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -158,6 +184,7 @@ def initialize_database():
         connection.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kb_id TEXT NOT NULL DEFAULT 'default',
                 source_id INTEGER,
                 file_path TEXT UNIQUE NOT NULL,
                 title TEXT NOT NULL,
@@ -168,27 +195,76 @@ def initialize_database():
                 indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 status TEXT NOT NULL DEFAULT 'indexed',
                 error_message TEXT,
+                FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
                 FOREIGN KEY (source_id) REFERENCES knowledge_sources(id) ON DELETE SET NULL
             )
         """)
         connection.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kb_id TEXT NOT NULL DEFAULT 'default',
                 document_id INTEGER NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 token_count INTEGER NOT NULL DEFAULT 0,
                 start_line INTEGER,
                 end_line INTEGER,
+                page_number INTEGER,
+                sheet_name TEXT,
                 embedding_json TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
                 FOREIGN KEY (document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
             )
         """)
-        connection.execute("""
-            CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc
-            ON knowledge_chunks(document_id, chunk_index)
-        """)
+        try:
+            connection.execute("ALTER TABLE knowledge_documents ADD COLUMN kb_id TEXT NOT NULL DEFAULT 'default'")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("ALTER TABLE knowledge_chunks ADD COLUMN kb_id TEXT NOT NULL DEFAULT 'default'")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("ALTER TABLE knowledge_chunks ADD COLUMN page_number INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("ALTER TABLE knowledge_chunks ADD COLUMN sheet_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("ALTER TABLE conversations ADD COLUMN knowledge_base_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc
+                ON knowledge_chunks(document_id, chunk_index)
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_kb
+                ON knowledge_chunks(kb_id)
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_knowledge_docs_kb
+                ON knowledge_documents(kb_id)
+            """)
+        except sqlite3.OperationalError:
+            pass
 
         try:
             connection.execute("""
@@ -196,6 +272,7 @@ def initialize_database():
                     content,
                     chunk_id UNINDEXED,
                     document_id UNINDEXED,
+                    kb_id UNINDEXED,
                     title UNINDEXED,
                     file_path UNINDEXED
                 )
@@ -582,8 +659,105 @@ def get_conversation_by_id(conversation_id: int) -> dict | None:
 
 
 # =========================================================================
-# KNOWLEDGE ENGINE DATA HELPERS
+# KNOWLEDGE BASE & MULTI-DATASET DATA HELPERS (PHASE 3)
 # =========================================================================
+
+def create_knowledge_base(
+    kb_id: str,
+    name: str,
+    description: str = "",
+    owner_project: str = "default",
+    embedding_model: str = "local-fast",
+    embedding_dim: int = 128,
+) -> dict:
+    clean_id = kb_id.strip()
+    clean_name = name.strip()
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO knowledge_bases (
+                id, name, description, owner_project, embedding_model, embedding_dim, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'ready')
+            """,
+            (
+                clean_id,
+                clean_name,
+                description.strip(),
+                owner_project.strip(),
+                embedding_model.strip(),
+                embedding_dim,
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM knowledge_bases WHERE id = ?", (clean_id,)
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def get_knowledge_base(kb_id: str) -> dict | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM knowledge_bases WHERE id = ?", (kb_id.strip(),)
+        ).fetchone()
+        if not row:
+            return None
+        kb_data = dict(row)
+        # Add summary counts
+        stats = connection.execute(
+            """
+            SELECT COUNT(id) as document_count,
+                   COALESCE(SUM(size_bytes), 0) as total_bytes,
+                   COALESCE(SUM(chunk_count), 0) as total_chunks
+            FROM knowledge_documents
+            WHERE kb_id = ?
+            """,
+            (kb_id.strip(),),
+        ).fetchone()
+        if stats:
+            kb_data["document_count"] = stats["document_count"]
+            kb_data["total_bytes"] = stats["total_bytes"]
+            kb_data["total_chunks"] = stats["total_chunks"]
+        return kb_data
+
+
+def list_knowledge_bases() -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT kb.*,
+                   COUNT(kd.id) as document_count,
+                   COALESCE(SUM(kd.size_bytes), 0) as total_bytes,
+                   COALESCE(SUM(kd.chunk_count), 0) as total_chunks
+            FROM knowledge_bases kb
+            LEFT JOIN knowledge_documents kd ON kd.kb_id = kb.id
+            GROUP BY kb.id
+            ORDER BY kb.created_at ASC
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_knowledge_base(kb_id: str) -> bool:
+    clean_id = kb_id.strip()
+    with get_connection() as connection:
+        # Cascade delete FTS chunks
+        try:
+            connection.execute(
+                """
+                DELETE FROM knowledge_chunks_fts
+                WHERE document_id IN (SELECT id FROM knowledge_documents WHERE kb_id = ?)
+                """,
+                (clean_id,),
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        connection.execute("DELETE FROM knowledge_chunks WHERE kb_id = ?", (clean_id,))
+        connection.execute("DELETE FROM knowledge_documents WHERE kb_id = ?", (clean_id,))
+        cursor = connection.execute("DELETE FROM knowledge_bases WHERE id = ?", (clean_id,))
+        return cursor.rowcount > 0
+
 
 def create_knowledge_source(name: str, source_type: str, path: str = "") -> dict:
     with get_connection() as connection:
@@ -626,24 +800,26 @@ def upsert_knowledge_document(
     mime_type: str,
     size_bytes: int,
     chunk_count: int,
+    kb_id: str = "default",
     source_id: int | None = None,
     status: str = "indexed",
     error_message: str | None = None,
 ) -> int:
     with get_connection() as connection:
-        cursor = connection.execute(
+        connection.execute(
             """
             INSERT INTO knowledge_documents (
                 file_path, title, content_hash, mime_type,
-                size_bytes, chunk_count, source_id, status, error_message, indexed_at
+                size_bytes, chunk_count, kb_id, source_id, status, error_message, indexed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(file_path) DO UPDATE SET
                 title = excluded.title,
                 content_hash = excluded.content_hash,
                 mime_type = excluded.mime_type,
                 size_bytes = excluded.size_bytes,
                 chunk_count = excluded.chunk_count,
+                kb_id = excluded.kb_id,
                 source_id = coalesce(excluded.source_id, knowledge_documents.source_id),
                 status = excluded.status,
                 error_message = excluded.error_message,
@@ -656,6 +832,7 @@ def upsert_knowledge_document(
                 mime_type,
                 size_bytes,
                 chunk_count,
+                kb_id,
                 source_id,
                 status,
                 error_message,
@@ -668,12 +845,33 @@ def upsert_knowledge_document(
         return row["id"]
 
 
-def get_knowledge_document_by_path(file_path: str) -> dict | None:
+def get_knowledge_document_by_path(file_path: str, kb_id: str | None = None) -> dict | None:
     with get_connection() as connection:
-        row = connection.execute(
-            "SELECT * FROM knowledge_documents WHERE file_path = ?",
-            (file_path,),
-        ).fetchone()
+        if kb_id:
+            row = connection.execute(
+                "SELECT * FROM knowledge_documents WHERE file_path = ? AND kb_id = ?",
+                (file_path, kb_id),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM knowledge_documents WHERE file_path = ?",
+                (file_path,),
+            ).fetchone()
+    return dict(row) if row else None
+
+
+def get_knowledge_document_by_hash(content_hash: str, kb_id: str | None = None) -> dict | None:
+    with get_connection() as connection:
+        if kb_id:
+            row = connection.execute(
+                "SELECT * FROM knowledge_documents WHERE content_hash = ? AND kb_id = ?",
+                (content_hash, kb_id),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM knowledge_documents WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
     return dict(row) if row else None
 
 
@@ -686,16 +884,28 @@ def get_knowledge_document(doc_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def list_knowledge_documents() -> list[dict]:
+def list_knowledge_documents(kb_id: str | None = None) -> list[dict]:
     with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT d.*, s.name as source_name
-            FROM knowledge_documents d
-            LEFT JOIN knowledge_sources s ON d.source_id = s.id
-            ORDER BY d.indexed_at DESC
-            """
-        ).fetchall()
+        if kb_id:
+            rows = connection.execute(
+                """
+                SELECT d.*, s.name as source_name
+                FROM knowledge_documents d
+                LEFT JOIN knowledge_sources s ON d.source_id = s.id
+                WHERE d.kb_id = ?
+                ORDER BY d.indexed_at DESC
+                """,
+                (kb_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT d.*, s.name as source_name
+                FROM knowledge_documents d
+                LEFT JOIN knowledge_sources s ON d.source_id = s.id
+                ORDER BY d.indexed_at DESC
+                """
+            ).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -711,6 +921,7 @@ def delete_knowledge_document(doc_id: int) -> bool:
             pass
 
         # Cascade deletes chunks
+        connection.execute("DELETE FROM knowledge_chunks WHERE document_id = ?", (doc_id,))
         cursor = connection.execute(
             "DELETE FROM knowledge_documents WHERE id = ?",
             (doc_id,),
@@ -718,7 +929,7 @@ def delete_knowledge_document(doc_id: int) -> bool:
     return cursor.rowcount > 0
 
 
-def save_knowledge_chunks(doc_id: int, chunks: list[dict]) -> None:
+def save_knowledge_chunks(doc_id: int, chunks: list[dict], kb_id: str = "default") -> None:
     with get_connection() as connection:
         # Remove old chunks for this document
         connection.execute(
@@ -734,28 +945,32 @@ def save_knowledge_chunks(doc_id: int, chunks: list[dict]) -> None:
             pass
 
         doc = connection.execute(
-            "SELECT title, file_path FROM knowledge_documents WHERE id = ?",
+            "SELECT title, file_path, kb_id FROM knowledge_documents WHERE id = ?",
             (doc_id,),
         ).fetchone()
         title = doc["title"] if doc else ""
         file_path = doc["file_path"] if doc else ""
+        effective_kb = doc["kb_id"] if doc and doc["kb_id"] else kb_id
 
         for chunk in chunks:
             cursor = connection.execute(
                 """
                 INSERT INTO knowledge_chunks (
-                    document_id, chunk_index, content, token_count,
-                    start_line, end_line, embedding_json
+                    document_id, kb_id, chunk_index, content, token_count,
+                    start_line, end_line, page_number, sheet_name, embedding_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc_id,
+                    effective_kb,
                     chunk.get("chunk_index", 0),
                     chunk["content"],
                     chunk.get("token_count", len(chunk["content"].split())),
                     chunk.get("start_line"),
                     chunk.get("end_line"),
+                    chunk.get("page_number"),
+                    chunk.get("sheet_name"),
                     json.dumps(chunk.get("embedding", [])),
                 ),
             )
@@ -765,11 +980,11 @@ def save_knowledge_chunks(doc_id: int, chunks: list[dict]) -> None:
                 connection.execute(
                     """
                     INSERT INTO knowledge_chunks_fts (
-                        content, chunk_id, document_id, title, file_path
+                        content, chunk_id, document_id, kb_id, title, file_path
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (chunk["content"], str(chunk_id), str(doc_id), title, file_path),
+                    (chunk["content"], str(chunk_id), str(doc_id), effective_kb, title, file_path),
                 )
             except sqlite3.OperationalError:
                 pass
@@ -788,7 +1003,11 @@ def get_knowledge_chunks(doc_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def search_knowledge_chunks_fts(query: str, limit: int = 10) -> list[dict]:
+def search_knowledge_chunks_fts(
+    query: str,
+    kb_id: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
     # Clean query for FTS5 syntax
     sanitized_terms = [t for t in query.replace('"', "").replace("'", "").split() if t]
     if not sanitized_terms:
@@ -797,50 +1016,98 @@ def search_knowledge_chunks_fts(query: str, limit: int = 10) -> list[dict]:
 
     with get_connection() as connection:
         try:
-            rows = connection.execute(
-                """
-                SELECT fts.chunk_id, fts.document_id, fts.title, fts.file_path,
-                       kc.content, kc.chunk_index, kc.start_line, kc.end_line,
-                       rank as fts_rank
-                FROM knowledge_chunks_fts fts
-                JOIN knowledge_chunks kc ON kc.id = CAST(fts.chunk_id AS INTEGER)
-                WHERE knowledge_chunks_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (fts_query, limit),
-            ).fetchall()
+            if kb_id:
+                rows = connection.execute(
+                    """
+                    SELECT fts.chunk_id, fts.document_id, fts.title, fts.file_path,
+                           kc.content, kc.chunk_index, kc.start_line, kc.end_line,
+                           kc.page_number, kc.sheet_name, kc.kb_id,
+                           rank as fts_rank
+                    FROM knowledge_chunks_fts fts
+                    JOIN knowledge_chunks kc ON kc.id = CAST(fts.chunk_id AS INTEGER)
+                    WHERE knowledge_chunks_fts MATCH ? AND kc.kb_id = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, kb_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT fts.chunk_id, fts.document_id, fts.title, fts.file_path,
+                           kc.content, kc.chunk_index, kc.start_line, kc.end_line,
+                           kc.page_number, kc.sheet_name, kc.kb_id,
+                           rank as fts_rank
+                    FROM knowledge_chunks_fts fts
+                    JOIN knowledge_chunks kc ON kc.id = CAST(fts.chunk_id AS INTEGER)
+                    WHERE knowledge_chunks_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, limit),
+                ).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.OperationalError:
             # Fallback to LIKE if FTS fails on punctuation
             like_term = f"%{sanitized_terms[0]}%"
-            rows = connection.execute(
-                """
-                SELECT kc.id as chunk_id, kc.document_id, kd.title, kd.file_path,
-                       kc.content, kc.chunk_index, kc.start_line, kc.end_line,
-                       0.0 as fts_rank
-                FROM knowledge_chunks kc
-                JOIN knowledge_documents kd ON kd.id = kc.document_id
-                WHERE kc.content LIKE ?
-                LIMIT ?
-                """,
-                (like_term, limit),
-            ).fetchall()
+            if kb_id:
+                rows = connection.execute(
+                    """
+                    SELECT kc.id as chunk_id, kc.document_id, kd.title, kd.file_path,
+                           kc.content, kc.chunk_index, kc.start_line, kc.end_line,
+                           kc.page_number, kc.sheet_name, kc.kb_id,
+                           0.0 as fts_rank
+                    FROM knowledge_chunks kc
+                    JOIN knowledge_documents kd ON kd.id = kc.document_id
+                    WHERE kc.content LIKE ? AND kc.kb_id = ?
+                    LIMIT ?
+                    """,
+                    (like_term, kb_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT kc.id as chunk_id, kc.document_id, kd.title, kd.file_path,
+                           kc.content, kc.chunk_index, kc.start_line, kc.end_line,
+                           kc.page_number, kc.sheet_name, kc.kb_id,
+                           0.0 as fts_rank
+                    FROM knowledge_chunks kc
+                    JOIN knowledge_documents kd ON kd.id = kc.document_id
+                    WHERE kc.content LIKE ?
+                    LIMIT ?
+                    """,
+                    (like_term, limit),
+                ).fetchall()
             return [dict(row) for row in rows]
 
 
-def get_all_chunks_with_embeddings() -> list[dict]:
+def get_all_chunks_with_embeddings(kb_id: str | None = None) -> list[dict]:
     with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT kc.id as chunk_id, kc.document_id, kc.chunk_index,
-                   kc.content, kc.start_line, kc.end_line, kc.embedding_json,
-                   kd.title, kd.file_path
-            FROM knowledge_chunks kc
-            JOIN knowledge_documents kd ON kd.id = kc.document_id
-            WHERE kc.embedding_json IS NOT NULL AND kc.embedding_json != '[]'
-            """
-        ).fetchall()
+        if kb_id:
+            rows = connection.execute(
+                """
+                SELECT kc.id as chunk_id, kc.document_id, kc.chunk_index,
+                       kc.content, kc.start_line, kc.end_line, kc.page_number,
+                       kc.sheet_name, kc.kb_id, kc.embedding_json,
+                       kd.title, kd.file_path
+                FROM knowledge_chunks kc
+                JOIN knowledge_documents kd ON kd.id = kc.document_id
+                WHERE kc.kb_id = ? AND kc.embedding_json IS NOT NULL AND kc.embedding_json != '[]'
+                """,
+                (kb_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT kc.id as chunk_id, kc.document_id, kc.chunk_index,
+                       kc.content, kc.start_line, kc.end_line, kc.page_number,
+                       kc.sheet_name, kc.kb_id, kc.embedding_json,
+                       kd.title, kd.file_path
+                FROM knowledge_chunks kc
+                JOIN knowledge_documents kd ON kd.id = kc.document_id
+                WHERE kc.embedding_json IS NOT NULL AND kc.embedding_json != '[]'
+                """
+            ).fetchall()
     results = []
     for row in rows:
         item = dict(row)

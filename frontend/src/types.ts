@@ -33,8 +33,24 @@ export type Approval = {
   alternatives: string;
 };
 
+export type KnowledgeBase = {
+  id: string;
+  name: string;
+  description: string;
+  owner_project: string;
+  embedding_model: string;
+  embedding_dim: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  document_count?: number;
+  total_bytes?: number;
+  total_chunks?: number;
+};
+
 export type KnowledgeDoc = {
   id: number;
+  kb_id?: string;
   source_id?: number | null;
   file_path: string;
   title: string;
@@ -57,16 +73,22 @@ export type KnowledgeChunk = {
   token_count: number;
   start_line?: number;
   end_line?: number;
+  page_number?: number;
+  sheet_name?: string;
 };
 
 export type SearchResult = {
   citation_id: string;
+  kb_id?: string;
   document_id: number;
   title: string;
   file_path: string;
+  path?: string;
   chunk_index: number;
   start_line?: number;
   end_line?: number;
+  page_number?: number;
+  sheet_name?: string;
   snippet: string;
   content: string;
   score: number;

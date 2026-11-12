@@ -116,3 +116,32 @@ def chunk_text(
         })
 
     return chunks
+
+
+def chunk_sections(
+    sections: list,
+    chunk_size: int = 800,
+    overlap: int = 150,
+) -> list[dict]:
+    """
+    Chunk multiple DocumentSections (e.g., individual PDF pages or Excel sheets),
+    retaining their respective page_number, sheet_name, and section_title metadata.
+    """
+    all_chunks = []
+    chunk_counter = 0
+
+    for section in sections:
+        content = getattr(section, "content", "") if not isinstance(section, dict) else section.get("content", "")
+        page_num = getattr(section, "page_number", None) if not isinstance(section, dict) else section.get("page_number")
+        sheet_nm = getattr(section, "sheet_name", None) if not isinstance(section, dict) else section.get("sheet_name")
+
+        raw_chunks = chunk_text(content, chunk_size=chunk_size, overlap=overlap)
+        for rc in raw_chunks:
+            rc["chunk_index"] = chunk_counter
+            rc["page_number"] = page_num
+            rc["sheet_name"] = sheet_nm
+            all_chunks.append(rc)
+            chunk_counter += 1
+
+    return all_chunks
+

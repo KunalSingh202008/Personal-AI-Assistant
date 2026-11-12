@@ -12,7 +12,7 @@ import BrowserAgentView from "./components/BrowserAgentView";
 import VoiceAssistant from "./components/VoiceAssistant";
 import PCControlView from "./components/PCControlView";
 import { sanitizeMessagePayload } from "./messageUtils";
-import type { AgentTaskView, Approval, Conversation, Message } from "./types";
+import type { AgentTaskView, Approval, Conversation, KnowledgeBase, Message, SearchResult } from "./types";
 
 type AppTab =
   | "voice"
@@ -54,7 +54,9 @@ type StreamEvent = {
   state?: string;
   status?: string;
   path?: string;
-  sources?: { citation_id: string; title: string; path: string; snippet: string; score: number }[];
+  sources?: SearchResult[];
+  kb_id?: string;
+  kb_name?: string;
 };
 
 let activeApiUrl = (() => {
@@ -345,7 +347,10 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState("Checking model...");
   const [mode, setMode] = useState<AssistantMode>("chat");
   const [researchDepth, setResearchDepth] = useState<ResearchDepth>("standard");
-  const [researchSources, setResearchSources] = useState<{ citation_id: string; title: string; path: string; snippet: string; score: number }[]>([]);
+  const [researchSources, setResearchSources] = useState<{ citation_id: string; title: string; path?: string; snippet: string; score: number }[]>([]);
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
+  const [selectedKbId, setSelectedKbId] = useState<string>("default");
+  const [chatSources, setChatSources] = useState<SearchResult[]>([]);
   const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
 
   const [workspace, setWorkspace] = useState("");
@@ -401,6 +406,18 @@ export default function App() {
     setConversations(await response.json() as Conversation[]);
   }, [apiUrl]);
 
+  const loadKnowledgeBases = useCallback(async (baseUrl: string = apiUrl) => {
+    try {
+      const resp = await fetch(`${baseUrl}/api/knowledge/bases`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setKnowledgeBases(data.knowledge_bases || []);
+      }
+    } catch {
+      // silent
+    }
+  }, [apiUrl]);
+
   useEffect(() => {
     let active = true;
     const initialize = async () => {
@@ -451,6 +468,7 @@ export default function App() {
       setProjectContextDraft(savedContext.context);
       setProjectContextReady(true);
       void fetchAutonomy();
+      void loadKnowledgeBases(resolvedBackend);
     };
     void initialize().catch((reason: unknown) => {
       if (!active) return;
@@ -460,7 +478,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [fetchAutonomy]);
+  }, [fetchAutonomy, loadKnowledgeBases]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -748,6 +766,7 @@ export default function App() {
     setError("");
     setRetryTurnId(turnId);
     setProgress([]);
+    setChatSources([]);
     setAgentTask(null);
     setApproval(null);
     setLoading(true);
@@ -781,6 +800,7 @@ export default function App() {
         messages: payloadMessages,
         conversation_id: conversationId,
         turn_id: turnId,
+        kb_id: selectedKbId || undefined,
       };
 
       if (mode === "agent") {
@@ -829,6 +849,10 @@ export default function App() {
         if (event.type === "evidence_summary" && event.sources) {
           setResearchSources(event.sources);
           addProgress(`Gathered ${event.sources.length} evidence sources.`);
+        }
+        if (event.type === "sources" && event.sources) {
+          setChatSources(event.sources);
+          addProgress(`Retrieved ${event.sources.length} knowledge source citations.`);
         }
 
         // Coding Agent events
@@ -978,6 +1002,7 @@ export default function App() {
             className={`nav-tab ${activeTab === "chat" ? "active" : ""}`}
             onClick={() => {
               if (conversationId) void selectChat(conversationId);
+              void loadKnowledgeBases();
               setActiveTab("chat");
             }}
           >
@@ -1247,6 +1272,23 @@ export default function App() {
                   </select>
                 </label>
 
+                <label className="mode-toggle">
+                  <span>Knowledge Base</span>
+                  <select
+                    value={selectedKbId}
+                    onChange={(event) => setSelectedKbId(event.target.value)}
+                    disabled={loading}
+                    aria-label="Knowledge Base"
+                  >
+                    <option value="">None (General Chat)</option>
+                    {knowledgeBases.map((kb) => (
+                      <option key={kb.id} value={kb.id}>
+                        {kb.name} ({kb.document_count || 0} docs)
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
                 {mode === "research" && (
                   <label className="depth-toggle">
                     <span>Depth</span>
@@ -1340,6 +1382,43 @@ export default function App() {
                         <div className="evidence-head">
                           <span className="citation-badge">{s.citation_id}</span>
                           <strong>{s.title}</strong>
+                        </div>
+                        <p className="evidence-snippet">{s.snippet}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Knowledge Base RAG Grounded Sources */}
+              {chatSources.length > 0 && (
+                <div className="research-sources-box" style={{ borderColor: "#6366f1" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
+                    <h4 style={{ margin: 0 }}>Grounded Knowledge Citations ({chatSources.length})</h4>
+                    <button
+                      className="btn-sm"
+                      onClick={() => setChatSources([])}
+                      style={{ fontSize: "0.75rem", padding: "2px 8px" }}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                  <div className="evidence-grid">
+                    {chatSources.map((s) => (
+                      <div className="evidence-item" key={s.citation_id}>
+                        <div className="evidence-head" style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                          <span className="citation-badge" style={{ background: "#6366f1" }}>{s.citation_id}</span>
+                          <strong>{s.title}</strong>
+                          {s.page_number && (
+                            <span style={{ background: "#3b82f6", color: "#fff", padding: "1px 6px", borderRadius: "4px", fontSize: "0.75rem" }}>
+                              Page {s.page_number}
+                            </span>
+                          )}
+                          {s.sheet_name && (
+                            <span style={{ background: "#10b981", color: "#fff", padding: "1px 6px", borderRadius: "4px", fontSize: "0.75rem" }}>
+                              Sheet: {s.sheet_name}
+                            </span>
+                          )}
                         </div>
                         <p className="evidence-snippet">{s.snippet}</p>
                       </div>

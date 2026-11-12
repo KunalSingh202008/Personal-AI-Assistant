@@ -38,10 +38,11 @@ class KelaEngine:
         turn_id: Optional[str] = None,
         workspace_path: Optional[str] = None,
         model: Optional[str] = None,
+        kb_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Executes an end-to-end conversational turn with streaming tokens,
-        evidence injection, data integrity, and atomic cancellation cleanup.
+        evidence injection, data integrity, knowledge base RAG, and atomic cancellation cleanup.
         """
         user_messages = [m for m in messages if m.get("role") == "user"]
         if not user_messages:
@@ -145,6 +146,66 @@ class KelaEngine:
                 except Exception as exc:
                     logger.warning("Document processor failed: %s", exc)
 
+            # 5.5 Multi-Dataset Knowledge Engine RAG Retrieval (Phase 3)
+            citations: List[Dict[str, Any]] = []
+            if kb_id and kb_id.strip():
+                clean_kb = kb_id.strip()
+                try:
+                    from knowledge.engine import search_knowledge_base, get_knowledge_base_details
+                    kb_info = get_knowledge_base_details(clean_kb)
+                    kb_name = kb_info.get("name", clean_kb) if kb_info else clean_kb
+                    yield ndjson({"step": f"Searching knowledge base '{kb_name}'..."})
+
+                    results = search_knowledge_base(last_user_message, kb_id=clean_kb, top_k=4)
+                    if results:
+                        yield ndjson({
+                            "step": f"Retrieved {len(results)} relevant source excerpts from '{kb_name}'."
+                        })
+                        for res in results:
+                            citations.append({
+                                "citation_id": res["citation_id"],
+                                "title": res["title"],
+                                "file_path": res["file_path"],
+                                "page_number": res.get("page_number"),
+                                "sheet_name": res.get("sheet_name"),
+                                "start_line": res.get("start_line"),
+                                "end_line": res.get("end_line"),
+                                "snippet": res["snippet"],
+                                "content": res["content"],
+                                "score": res["score"],
+                                "kb_id": clean_kb,
+                                "kb_name": kb_name,
+                            })
+                            # Format citation title
+                            ref_title = res["title"]
+                            if res.get("page_number"):
+                                ref_title += f" [Page {res['page_number']}]"
+                            elif res.get("sheet_name"):
+                                ref_title += f" [Sheet: {res['sheet_name']}]"
+
+                            evidence_msgs.append(
+                                self.prompts.format_untrusted_evidence(
+                                    title=f"{res['citation_id']} {ref_title}",
+                                    source_url=res["file_path"],
+                                    text=res["content"],
+                                )
+                            )
+
+                        # Emit citations event to frontend
+                        yield ndjson({
+                            "type": "sources",
+                            "sources": citations,
+                            "kb_id": clean_kb,
+                            "kb_name": kb_name,
+                        })
+                    else:
+                        yield ndjson({
+                            "step": f"No relevant information found in knowledge base '{kb_name}'."
+                        })
+                except Exception as ex:
+                    logger.error("RAG retrieval failed: %s", ex)
+                    yield ndjson({"step": f"Knowledge search unavailable: {str(ex)}"})
+
             # 6. Assemble and Prune Message List within Token Budget
             assembled_messages = self.prompts.assemble_model_messages(
                 raw_messages=messages,
@@ -199,6 +260,7 @@ class KelaEngine:
         conversation_id: Optional[int] = None,
         turn_id: Optional[str] = None,
         workspace_path: Optional[str] = None,
+        kb_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Unifies voice interaction with KELA's central engine, persistence,

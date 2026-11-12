@@ -49,11 +49,17 @@ from database import (
     update_student_task,
 )
 from knowledge.engine import (
+    create_knowledge_base,
     delete_indexed_document,
+    delete_knowledge_base,
     get_document_details,
+    get_knowledge_base_details,
     index_directory,
     index_file,
+    ingest_uploaded_file,
     list_indexed_documents,
+    list_knowledge_bases,
+    reindex_knowledge_base,
     search_knowledge_base,
 )
 from memory.manager import MemoryManager
@@ -279,6 +285,7 @@ class ChatRequest(BaseModel):
     messages: list[Message] = Field(min_length=1, max_length=50)
     conversation_id: int | None = None
     turn_id: str | None = Field(default=None, max_length=100)
+    kb_id: str | None = None
 
 
 class AgentRequest(ChatRequest):
@@ -310,19 +317,30 @@ class ConversationTitleRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
 
 
+class KnowledgeBaseCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+    owner_project: str = Field(default="default", max_length=100)
+    embedding_model: str = Field(default="local-fast", max_length=50)
+    kb_id: Optional[str] = None
+
+
 class KnowledgeIndexFileRequest(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
+    kb_id: str = "default"
     source_id: int | None = None
 
 
 class KnowledgeIndexDirRequest(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
+    kb_id: str = "default"
     recursive: bool = True
     source_id: int | None = None
 
 
 class KnowledgeSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
+    kb_id: str = "default"
     top_k: int = Field(default=5, ge=1, le=20)
     hybrid: bool = True
 
@@ -330,6 +348,7 @@ class KnowledgeSearchRequest(BaseModel):
 class KnowledgeUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content: str = Field(min_length=1)
+    kb_id: str = "default"
 
 
 class ConnectorCreateRequest(BaseModel):
@@ -911,9 +930,59 @@ async def export_conversation(conversation_id: int, format: str = "markdown"):
 # KNOWLEDGE ENGINE ROUTES
 # =========================================================================
 
+@app.get("/api/knowledge/bases")
+async def list_knowledge_bases_route():
+    return {"knowledge_bases": list_knowledge_bases()}
+
+
+@app.post("/api/knowledge/bases")
+async def create_knowledge_base_route(request: KnowledgeBaseCreateRequest):
+    try:
+        kb = create_knowledge_base(
+            name=request.name,
+            description=request.description,
+            owner_project=request.owner_project,
+            embedding_model=request.embedding_model,
+            kb_id=request.kb_id,
+        )
+        return {"knowledge_base": kb}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/knowledge/bases/{kb_id}")
+async def get_knowledge_base_route(kb_id: str):
+    kb = get_knowledge_base_details(kb_id)
+    if not kb:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    return {"knowledge_base": kb}
+
+
+@app.delete("/api/knowledge/bases/{kb_id}")
+async def delete_knowledge_base_route(kb_id: str):
+    success = delete_knowledge_base(kb_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    return {"deleted": True, "kb_id": kb_id}
+
+
+@app.post("/api/knowledge/bases/{kb_id}/reindex")
+async def reindex_knowledge_base_route(kb_id: str):
+    try:
+        res = reindex_knowledge_base(kb_id)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/knowledge/documents")
-async def get_knowledge_documents():
-    return {"documents": list_indexed_documents()}
+async def get_knowledge_documents(kb_id: Optional[str] = None):
+    return {"documents": list_indexed_documents(kb_id=kb_id)}
+
+
+@app.get("/api/knowledge/bases/{kb_id}/documents")
+async def get_knowledge_base_documents(kb_id: str):
+    return {"documents": list_indexed_documents(kb_id=kb_id)}
 
 
 @app.get("/api/knowledge/documents/{doc_id}")
@@ -935,7 +1004,7 @@ async def delete_knowledge_document_route(doc_id: int):
 @app.post("/api/knowledge/index-file")
 async def index_knowledge_file(request: KnowledgeIndexFileRequest):
     try:
-        res = index_file(request.path, source_id=request.source_id)
+        res = index_file(request.path, kb_id=request.kb_id, source_id=request.source_id)
         return res
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -944,7 +1013,7 @@ async def index_knowledge_file(request: KnowledgeIndexFileRequest):
 @app.post("/api/knowledge/index-directory")
 async def index_knowledge_directory(request: KnowledgeIndexDirRequest):
     try:
-        res = index_directory(request.path, source_id=request.source_id, recursive=request.recursive)
+        res = index_directory(request.path, kb_id=request.kb_id, source_id=request.source_id, recursive=request.recursive)
         return res
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -952,26 +1021,24 @@ async def index_knowledge_directory(request: KnowledgeIndexDirRequest):
 
 @app.post("/api/knowledge/search")
 async def search_knowledge(request: KnowledgeSearchRequest):
-    results = search_knowledge_base(request.query, top_k=request.top_k, hybrid=request.hybrid)
+    results = search_knowledge_base(request.query, kb_id=request.kb_id, top_k=request.top_k, hybrid=request.hybrid)
     return {"results": results, "count": len(results)}
 
 
 @app.post("/api/knowledge/upload")
 async def upload_and_index_document(request: KnowledgeUploadRequest):
-    # Safe storage directory for uploaded documents inside the selected workspace
-    storage_dir = Path(app.state.workspace) / ".nexus_uploads"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    target_path = storage_dir / Path(request.filename).name
-
     try:
         if request.content.startswith("data:") and ";base64," in request.content:
             _, b64 = request.content.split(";base64,", 1)
             raw = base64.b64decode(b64)
-            target_path.write_bytes(raw)
         else:
-            target_path.write_text(request.content, encoding="utf-8")
+            raw = request.content.encode("utf-8")
 
-        res = index_file(target_path)
+        res = ingest_uploaded_file(
+            filename=request.filename,
+            content_bytes=raw,
+            kb_id=request.kb_id,
+        )
         return res
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Upload indexing failed: {exc}") from exc
@@ -1380,6 +1447,7 @@ async def chat(request: ChatRequest):
             turn_id=turn_id,
             workspace_path=str(workspace_path),
             model=model,
+            kb_id=request.kb_id,
         ),
         media_type="application/x-ndjson",
         headers={
@@ -1462,6 +1530,7 @@ class VoiceCommandRequest(BaseModel):
     conversation_id: Optional[int] = None
     turn_id: Optional[str] = None
     workspace_path: Optional[str] = None
+    kb_id: Optional[str] = None
 
 class VoiceSpeakRequest(BaseModel):
     text: str
@@ -1486,6 +1555,7 @@ async def voice_command_endpoint(req: VoiceCommandRequest):
         conversation_id=req.conversation_id,
         turn_id=req.turn_id,
         workspace_path=req.workspace_path,
+        kb_id=req.kb_id,
     )
 
 @app.post("/api/pc/launch", dependencies=[Security(require_local_auth)])
