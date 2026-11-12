@@ -11,6 +11,8 @@ from .context_manager import context_manager
 from .prompt_manager import prompt_manager
 from .permission_manager import permission_manager
 from .tool_registry import tool_registry
+from .intent_engine import intent_engine
+from .entity_tracker import entity_tracker
 
 logger = logging.getLogger("kela.engine")
 
@@ -90,6 +92,86 @@ class KelaEngine:
 
             # Signal conversation ID to client
             yield ndjson({"conversation_id": conversation_id})
+
+            # Structured intent classification for text interface
+            intent = intent_engine.classify_intent(last_user_message, conversation_id=conversation_id)
+
+            if intent.intent_type in {"SESSION_CONTROL"}:
+                resp = intent.response_text
+                yield ndjson({"token": resp})
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=resp,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                yield ndjson({"done": True, "conversation_id": conversation_id})
+                return
+
+            elif intent.intent_type == "CLARIFICATION_NEEDED":
+                cq = intent.clarification_question or "Could you please clarify your request?"
+                yield ndjson({"token": cq})
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=cq,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                yield ndjson({"done": True, "conversation_id": conversation_id})
+                return
+
+            elif intent.intent_type == "UNSUPPORTED":
+                unsupported_msg = intent.response_text or "I cannot assist with that request."
+                yield ndjson({"token": unsupported_msg})
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=unsupported_msg,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                yield ndjson({"done": True, "conversation_id": conversation_id})
+                return
+
+            elif intent.intent_type == "ACTION":
+                action_name = intent.tool_name or ""
+                risk = self.tools.get_tool_risk(action_name)
+                if risk == "RED":
+                    refuse_msg = f"The operation '{action_name}' is blocked by security policy."
+                    yield ndjson({"token": refuse_msg})
+                    self.conversations.save_assistant_message(
+                        conversation_id=conversation_id,
+                        content=refuse_msg,
+                        client_message_id=f"{active_turn_id}:assistant",
+                    )
+                    yield ndjson({"done": True, "conversation_id": conversation_id})
+                    return
+                elif risk == "AMBER":
+                    yield ndjson({"step": f"Operation '{action_name}' requires explicit approval."})
+                    approval_msg = f"Operation '{action_name}' requires approval before execution."
+                    if action_name == "run_project":
+                        pname = intent.parameters.get("project_name", "project")
+                        approval_msg = f"To run project '{pname}', please confirm execution approval."
+                    yield ndjson({"token": approval_msg})
+                    self.conversations.save_assistant_message(
+                        conversation_id=conversation_id,
+                        content=approval_msg,
+                        client_message_id=f"{active_turn_id}:assistant",
+                    )
+                    yield ndjson({"done": True, "conversation_id": conversation_id})
+                    return
+                else:
+                    # GREEN Safe action: execute tool
+                    yield ndjson({"step": f"Executing tool '{action_name}'..."})
+                    tool_res = self.tools.execute_tool(action_name, intent.parameters)
+                    entity_tracker.update_from_action_result(
+                        conversation_id, action_name, intent.parameters, tool_res.get("result", {}), lang=intent.language
+                    )
+                    resp_text = intent_engine.format_action_response(intent, tool_res, lang=intent.language)
+                    yield ndjson({"token": resp_text})
+                    self.conversations.save_assistant_message(
+                        conversation_id=conversation_id,
+                        content=resp_text,
+                        client_message_id=f"{active_turn_id}:assistant",
+                    )
+                    yield ndjson({"done": True, "conversation_id": conversation_id})
+                    return
 
             # 3. Assemble System Context and Preferences
             project_context = self.context.get_workspace_context(workspace_path) if workspace_path else ""
@@ -310,9 +392,68 @@ class KelaEngine:
                 )
 
             # 4. Resolve voice intent
-            intent = resolve_voice_intent(clean_text)
+            intent = resolve_voice_intent(clean_text, conversation_id=conversation_id)
             action_name = intent["action"]
             lang = intent.get("lang", lang)
+            intent_type = intent.get("intent_type", "ACTION")
+
+            # Handle Session Controls, Greetings, Direct Precomputed Questions
+            if intent_type in {"SESSION_CONTROL"} or (intent_type == "QUESTION" and intent.get("response_text")):
+                response_text = intent["response_text"]
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=response_text,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                return {
+                    "conversation_id": conversation_id,
+                    "turn_id": active_turn_id,
+                    "handled": True,
+                    "fast_path": True,
+                    "response_text": response_text,
+                    "action": action_name,
+                    "lang": lang,
+                    "stop_session": intent.get("stop_session", False),
+                    "pause_session": intent.get("pause_session", False),
+                }
+
+            # Handle Clarification Requests
+            if intent_type == "CLARIFICATION_NEEDED":
+                cq = intent.get("clarification_question") or "Could you please clarify your request?"
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=cq,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                return {
+                    "conversation_id": conversation_id,
+                    "turn_id": active_turn_id,
+                    "handled": True,
+                    "fast_path": True,
+                    "response_text": cq,
+                    "action": "clarification_needed",
+                    "clarification_needed": True,
+                    "lang": lang,
+                }
+
+            # Handle Unsupported Requests honestly (Never silently drop)
+            if intent_type == "UNSUPPORTED":
+                unsupported_text = intent.get("response_text") or "I cannot perform that operation."
+                self.conversations.save_assistant_message(
+                    conversation_id=conversation_id,
+                    content=unsupported_text,
+                    client_message_id=f"{active_turn_id}:assistant",
+                )
+                return {
+                    "conversation_id": conversation_id,
+                    "turn_id": active_turn_id,
+                    "handled": True,
+                    "fast_path": True,
+                    "response_text": unsupported_text,
+                    "action": "unsupported_command",
+                    "unsupported": True,
+                    "lang": lang,
+                }
 
             # 5. Tool Registry Risk & Action Permission Check (Requirements 7 & 8)
             risk = self.tools.get_tool_risk(action_name)
@@ -342,6 +483,13 @@ class KelaEngine:
                     if lang == "hinglish"
                     else f"Operation '{action_name}' requires explicit approval in workspace."
                 )
+                if action_name == "run_project":
+                    pname = intent.get("params", {}).get("project_name", "project")
+                    approval_text = (
+                        f"{pname} project locally run karne ke liye approval zaroori hai."
+                        if lang == "hinglish"
+                        else f"Running project '{pname}' requires execution approval."
+                    )
                 self.conversations.save_assistant_message(
                     conversation_id=conversation_id,
                     content=approval_text,
@@ -359,7 +507,7 @@ class KelaEngine:
                 }
 
             # 6. Execute safe action or delegate to inference provider
-            exec_result = await execute_voice_action(intent)
+            exec_result = await execute_voice_action(intent, conversation_id=conversation_id)
             response_text = exec_result.get("response_text", "")
 
             if exec_result.get("needs_summary"):

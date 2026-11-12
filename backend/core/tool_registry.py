@@ -1,30 +1,218 @@
+"""
+Centralized Tool Registry for KELA AI Platform.
+Manages tool definitions, typed JSON schemas, risk classification (GREEN, AMBER, RED),
+and execution dispatching across PC operations, system automation, and workspace tools.
+"""
+
 from typing import Dict, Any, List, Optional
+import os
 import action_policy
 from workspace_tools import TOOL_SCHEMAS
+import pc_control
+
+# Native PC and System tool schemas with typed JSON schemas
+PC_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "name": "launch_app",
+        "description": "Launch or focus a Windows desktop application (e.g. calculator, camera, chrome, vscode, notepad, spotify, terminal).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Name or executable keyword of the application (e.g., 'calculator', 'camera', 'chrome', 'vscode', 'notepad')."
+                }
+            },
+            "required": ["app_name"]
+        }
+    },
+    {
+        "name": "close_app",
+        "description": "Close or terminate a running Windows application by name.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Name or executable keyword of the application to close."
+                }
+            },
+            "required": ["app_name"]
+        }
+    },
+    {
+        "name": "change_volume",
+        "description": "Adjust system master volume up or down by step intervals.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down"],
+                    "description": "Direction to change volume ('up' or 'down')."
+                },
+                "steps": {
+                    "type": "integer",
+                    "description": "Number of volume steps (each step is ~2%). Default is 5.",
+                    "default": 5
+                }
+            },
+            "required": ["direction"]
+        }
+    },
+    {
+        "name": "set_volume",
+        "description": "Set master system volume to a specific percentage level.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "integer",
+                    "description": "Volume level from 0 to 100 percent.",
+                    "minimum": 0,
+                    "maximum": 100
+                }
+            },
+            "required": ["level"]
+        }
+    },
+    {
+        "name": "toggle_mute",
+        "description": "Toggle master audio mute state.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_system_metrics",
+        "description": "Retrieve real-time hardware telemetry including RAM usage percentage, memory stats, CPU load, and battery status.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "capture_desktop_screenshot",
+        "description": "Capture a screenshot of the user's primary Windows desktop display.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "search_user_files",
+        "description": "Search common user directories (Downloads, Documents, Desktop) for files or project folders matching a query.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query or project/file name pattern."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of search results to return.",
+                    "default": 15
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "find_resume_files",
+        "description": "Locate resume, CV, or biodata documents across user directories.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "open_file_path",
+        "description": "Open a specified local file in its default Windows desktop application.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Full absolute path to the file to open."
+                }
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "Search the internet using the system browser.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "run_project",
+        "description": "Run or launch a local coding project (e.g. Phone Doctor, NexusAI). Requires user confirmation/approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_name": {
+                    "type": "string",
+                    "description": "Name of the project to run."
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Path to the project directory."
+                }
+            },
+            "required": ["project_name"]
+        }
+    }
+]
 
 SAFE_VOICE_ACTIONS = {
     # System & Audio
-    "volume_up", "volume_down", "set_volume", "toggle_mute",
+    "volume_up", "volume_down", "set_volume", "toggle_mute", "change_volume",
     # Native Apps & Tools
     "launch_camera", "launch_youtube", "launch_chrome", "launch_vscode",
     "launch_calculator", "launch_notepad", "launch_app", "close_app",
     # File & Status
-    "find_resume", "open_latest_pdf", "open_downloads",
-    "screenshot", "battery_status", "system_status", "time", "date",
-    "web_search", "web_search_summary",
+    "find_resume", "find_resume_files", "open_latest_pdf", "open_downloads",
+    "screenshot", "capture_desktop_screenshot", "battery_status", "system_status",
+    "get_system_metrics", "time", "date",
+    "web_search", "web_search_summary", "search_user_files", "open_file_path",
     # Conversational / Assistant State
     "stop_listening", "pause_listening", "assistant_identity",
     "help", "identity", "projects_info", "greeting", "conversational_ai"
 }
 
+RISKY_APPROVAL_ACTIONS = {
+    "run_project", "run_command", "write_file", "git_commit", "start_local_server"
+}
+
+BLOCKED_ACTIONS = {
+    "format_drive", "delete_root", "destroy_system", "kill_system"
+}
+
+
 class ToolRegistry:
     """
     Centralized tool registry managing tool schemas, action risk levels,
-    and invocation boundaries across the KELA AI platform.
+    and execution boundaries across the KELA AI platform.
     """
 
     def __init__(self):
-        self._schemas = {schema["name"]: schema for schema in TOOL_SCHEMAS}
+        # Register both workspace coding tools and native PC/system tools
+        self._schemas: Dict[str, Dict[str, Any]] = {}
+        for schema in TOOL_SCHEMAS:
+            self._schemas[schema["name"]] = schema
+        for schema in PC_TOOL_SCHEMAS:
+            self._schemas[schema["name"]] = schema
 
     def list_schemas(self) -> List[Dict[str, Any]]:
         """Return registered JSON schemas for all available tools."""
@@ -35,17 +223,24 @@ class ToolRegistry:
         return self._schemas.get(tool_name)
 
     def is_safe_voice_action(self, action_name: str) -> bool:
-        """Check whether action is allowlisted for voice execution."""
+        """Check whether action is allowlisted for safe auto-execution in voice mode."""
         return action_name in SAFE_VOICE_ACTIONS
 
     def get_tool_risk(self, action_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
         """
         Evaluate tool risk category (GREEN, AMBER, RED) using centralized action policy:
-        - GREEN: Safe read-only inspection or allowlisted voice action (auto-approved)
-        - AMBER: Workspace writes and allowlisted commands (explicit user approval required)
+        - GREEN: Safe read-only inspection or allowlisted voice/PC action (auto-approved)
+        - AMBER: Operations requiring explicit user confirmation / approval
         - RED: Destructive / unauthorized operations (strictly blocked)
         """
-        if action_name in SAFE_VOICE_ACTIONS:
+        if action_name in BLOCKED_ACTIONS:
+            return "RED"
+        if action_name in RISKY_APPROVAL_ACTIONS:
+            return "AMBER"
+        if action_name in SAFE_VOICE_ACTIONS or action_name in self._schemas:
+            # Check if this schema is an amber workspace tool
+            if action_name in {"write_file", "run_command", "git_commit", "start_local_server", "run_project"}:
+                return "AMBER"
             return "GREEN"
         try:
             policy = action_policy.classify_action(action_name)
@@ -53,6 +248,135 @@ class ToolRegistry:
         except Exception:
             return "RED"
 
+    def execute_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Centrally dispatches tool execution with argument validation and error handling.
+        Returns a dictionary containing 'status', 'result', and error details if any.
+        """
+        context = context or {}
+        try:
+            # 1. Native Application Management
+            if tool_name in {"launch_app", "launch_calculator", "launch_camera", "launch_notepad", "launch_chrome", "launch_vscode", "launch_youtube"}:
+                app_target = arguments.get("app_name") or arguments.get("app")
+                if not app_target:
+                    if tool_name == "launch_calculator":
+                        app_target = "calculator"
+                    elif tool_name == "launch_camera":
+                        app_target = "camera"
+                    elif tool_name == "launch_notepad":
+                        app_target = "notepad"
+                    elif tool_name == "launch_chrome":
+                        app_target = "chrome"
+                    elif tool_name == "launch_vscode":
+                        app_target = "code"
+                    elif tool_name == "launch_youtube":
+                        app_target = "youtube"
+                    else:
+                        return {"status": "error", "message": "Missing 'app_name' parameter for launch_app."}
+
+                res = pc_control.launch_application(app_target)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            elif tool_name == "close_app":
+                app_target = arguments.get("app_name") or arguments.get("app")
+                if not app_target:
+                    return {"status": "error", "message": "Missing 'app_name' parameter for close_app."}
+                res = pc_control.close_application(app_target)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 2. Volume & Audio Management
+            elif tool_name == "change_volume":
+                direction = arguments.get("direction", "up")
+                steps = int(arguments.get("steps", 5))
+                res = pc_control.change_volume(direction, steps)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            elif tool_name == "set_volume":
+                level = int(arguments.get("level", 50))
+                res = pc_control.set_volume(level)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            elif tool_name == "toggle_mute":
+                res = pc_control.toggle_mute()
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 3. System Hardware & Telemetry
+            elif tool_name in {"get_system_metrics", "system_status", "battery_status"}:
+                res = pc_control.get_system_metrics()
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            # 4. Desktop Screenshot
+            elif tool_name in {"capture_desktop_screenshot", "screenshot"}:
+                res = pc_control.capture_desktop_screenshot()
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 5. File & Project Search
+            elif tool_name == "search_user_files":
+                query = arguments.get("query", "").strip()
+                max_results = int(arguments.get("max_results", 15))
+                res = pc_control.search_user_files(query, max_results=max_results)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            elif tool_name in {"find_resume_files", "find_resume"}:
+                found = pc_control.find_resume_files()
+                return {
+                    "status": "success",
+                    "result": {"results": found, "count": len(found)},
+                    "tool": tool_name,
+                }
+
+            elif tool_name == "open_file_path":
+                fpath = arguments.get("file_path", "").strip()
+                if not fpath:
+                    return {"status": "error", "message": "Missing 'file_path' parameter."}
+                res = pc_control.open_file_path(fpath)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 6. Web Search
+            elif tool_name in {"web_search", "web_search_in_browser"}:
+                query = arguments.get("query", "").strip()
+                res = pc_control.search_web_in_browser(query)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 7. Run Project
+            elif tool_name == "run_project":
+                project_name = arguments.get("project_name", "").strip()
+                project_path = arguments.get("project_path", "").strip()
+                if not project_path and project_name:
+                    # Look up path via search_user_files
+                    search_res = pc_control.search_user_files(project_name, max_results=5)
+                    dirs = [r for r in search_res.get("results", []) if r.get("is_project") or r.get("type") == "directory"]
+                    if dirs:
+                        project_path = dirs[0]["path"]
+
+                return {
+                    "status": "requires_approval",
+                    "requires_approval": True,
+                    "risk": "AMBER",
+                    "project_name": project_name,
+                    "project_path": project_path,
+                    "message": f"Running project '{project_name}' requires execution approval.",
+                    "tool": tool_name,
+                }
+
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Unknown tool '{tool_name}' cannot be dispatched.",
+                    "tool": tool_name,
+                }
+
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": f"Tool execution failed for '{tool_name}': {str(exc)}",
+                "tool": tool_name,
+            }
+
 
 tool_registry = ToolRegistry()
-
