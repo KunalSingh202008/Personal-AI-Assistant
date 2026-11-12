@@ -343,6 +343,77 @@ class KnowledgeEngineTests(unittest.TestCase):
 
         delete_knowledge_base(kb_id)
 
+    def test_json_and_jsonl_parsers(self):
+        """Verify structured JSON and JSONL datasets are parsed into readable summaries."""
+        from knowledge.parser import parse_json_content, parse_jsonl_content
+
+        # 1. JSON Array
+        arr_str = '[{"id": 1, "product": "Solar Panel"}, {"id": 2, "product": "Battery Pack"}]'
+        parsed_arr = parse_json_content(arr_str)
+        self.assertIn("JSON Dataset: Array of 2 items", parsed_arr)
+        self.assertIn("Solar Panel", parsed_arr)
+
+        # 2. JSON Object
+        obj_str = '{"company": "KELA Aerospace", "version": "3.0", "status": "active"}'
+        parsed_obj = parse_json_content(obj_str)
+        self.assertIn("JSON Document: Object with 3 root keys", parsed_obj)
+        self.assertIn("KELA Aerospace", parsed_obj)
+
+        # 3. JSONL Lines
+        jsonl_str = '{"user": "alice", "action": "login"}\n{"user": "bob", "action": "upload"}\n'
+        parsed_jsonl = parse_jsonl_content(jsonl_str)
+        self.assertIn("JSONL Dataset: 2 records total", parsed_jsonl)
+        self.assertIn("alice", parsed_jsonl)
+        self.assertIn("bob", parsed_jsonl)
+
+    def test_kela_engine_empty_retrieval_does_not_fabricate_sources(self):
+        """Verify KelaEngine gracefully reports empty retrieval and emits zero fake sources."""
+        import json
+        from core.engine import KelaEngine
+        from core.provider_manager import BaseInferenceProvider
+
+        class FallbackProvider(BaseInferenceProvider):
+            async def chat(self, messages, model=None, options=None):
+                return "I do not have specific internal knowledge on that topic."
+
+            async def stream_chat(self, messages, model=None, options=None):
+                yield {"token": "I do not have specific internal knowledge on that topic."}
+                yield {"done": True}
+
+            async def health_check(self):
+                return {"available": True}
+
+        fb_prov = FallbackProvider()
+        engine = KelaEngine()
+
+        kb_id = "kb_empty_test"
+        create_knowledge_base(name="Empty Test KB", kb_id=kb_id)
+
+        async def run_empty_stream():
+            events = []
+            async for ev_raw in engine.chat_stream(
+                [{"role": "user", "content": "Tell me about quantum gravity in 11 dimensions"}],
+                kb_id=kb_id,
+            ):
+                try:
+                    events.append(json.loads(ev_raw.strip()))
+                except Exception:
+                    pass
+            return events
+
+        with patch.object(engine.providers, "get_active_provider", return_value=fb_prov):
+            events = asyncio.run(run_empty_stream())
+
+        # Verify NO sources event was emitted (no hallucinated sources!)
+        source_events = [e for e in events if e.get("type") == "sources"]
+        self.assertEqual(len(source_events), 0, "KELA must never fabricate or invent citations on empty retrieval!")
+
+        # Verify step indicating no matches was emitted
+        step_events = [e.get("step", "") for e in events if "step" in e]
+        self.assertTrue(any("No relevant information found" in s for s in step_events))
+
+        delete_knowledge_base(kb_id)
+
 
 if __name__ == "__main__":
     unittest.main()
