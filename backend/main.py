@@ -1553,6 +1553,8 @@ async def voice_speak_endpoint(req: VoiceSpeakRequest):
 @app.post("/api/voice/conversation")
 async def voice_command_endpoint(req: VoiceCommandRequest):
     """Voice mode conversation & action dispatcher routed through central KelaEngine."""
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Voice text query cannot be empty")
     return await kela_engine.process_voice_turn(
         text=req.text,
         conversation_id=req.conversation_id,

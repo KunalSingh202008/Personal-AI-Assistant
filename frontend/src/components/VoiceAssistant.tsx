@@ -70,7 +70,9 @@ export default function VoiceAssistant({
   const [state, setState] = useState<VoiceState>("IDLE");
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState("");
+  const [confirmedTranscript, setConfirmedTranscript] = useState("");
   const [spokenStatusText, setSpokenStatusText] = useState("Click 'Start Voice Conversation' to begin.");
+  const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null);
   const [systemMetrics, setSystemMetrics] = useState<{
     cpu?: number;
     ram_used?: number;
@@ -180,9 +182,14 @@ export default function VoiceAssistant({
     }
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onstart = null;
+        recognitionRef.current.onspeechstart = null;
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
         recognitionRef.current.abort();
       } catch {
-        // intentional no-op on abort
+        // intentional no-op
       }
       recognitionRef.current = null;
     }
@@ -230,12 +237,14 @@ export default function VoiceAssistant({
     triggerBargeInRef.current = triggerBargeIn;
   }, [triggerBargeIn]);
 
-  // Setup Web Audio Analyser with Real-time Echo Cancellation
+  // Setup Web Audio Analyser (isolated, never blocks speech recognition)
   const initAudioAnalyser = useCallback(async () => {
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
       const extWin = window as ExtendedWindow;
       if (!audioContextRef.current) {
         const AudioContextClass = extWin.AudioContext || extWin.webkitAudioContext || window.AudioContext;
+        if (!AudioContextClass) return;
         audioContextRef.current = new AudioContextClass();
       }
       const audioCtx = audioContextRef.current;
@@ -247,11 +256,7 @@ export default function VoiceAssistant({
 
       if (!mediaStreamRef.current) {
         mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
       }
 
@@ -277,7 +282,7 @@ export default function VoiceAssistant({
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        // Active Barge-in check: If user speaks while KELA is talking, interrupt immediately
+        // Barge-in check: If user speaks while KELA is talking, interrupt immediately
         if (isSpeakingRef.current) {
           let energySum = 0;
           for (let i = 0; i < bufferLength; i++) {
@@ -333,11 +338,9 @@ export default function VoiceAssistant({
       ttsSafetyTimerRef.current = null;
     }
 
-    // Cancel pending speech and resume audio context if paused
     window.speechSynthesis.cancel();
     window.speechSynthesis.resume();
 
-    // Clean text to ensure only natural speech is spoken
     const cleanSpeech = text
       .replace(/[*_#`[\]()]/g, "")
       .replace(/https?:\/\/\S+/g, "link")
@@ -352,7 +355,7 @@ export default function VoiceAssistant({
     setSpokenStatusText(cleanSpeech);
 
     const utterance = new SpeechSynthesisUtterance(cleanSpeech);
-    utterance.rate = 1.15; // Snappy, natural pace
+    utterance.rate = 1.15;
     utterance.pitch = 1.0;
 
     const voices = window.speechSynthesis.getVoices();
@@ -389,8 +392,12 @@ export default function VoiceAssistant({
       if (shouldStopSession) {
         stopVoiceSessionRef.current();
       } else if (isSessionActiveRef.current) {
-        // AUTOMATICALLY RESUME LISTENING IMMEDIATELY!
-        resumeListeningRef.current();
+        // Safe 250ms audio release backoff before reopening mic
+        setTimeout(() => {
+          if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+            resumeListeningRef.current();
+          }
+        }, 250);
       } else {
         setState("IDLE");
       }
@@ -404,11 +411,9 @@ export default function VoiceAssistant({
     utterance.onend = onSpeechFinished;
     utterance.onerror = onSpeechFinished;
 
-    // Safety timeout: prevents Chrome's speech engine from locking up the assistant
     const estimatedDurationMs = Math.max(2500, cleanSpeech.length * 80);
     ttsSafetyTimerRef.current = setTimeout(() => {
       if (isSpeakingRef.current) {
-        console.log("TTS safety timeout triggered; auto-resuming listening.");
         window.speechSynthesis.cancel();
         onSpeechFinished();
       }
@@ -427,18 +432,16 @@ export default function VoiceAssistant({
       const cleanText = utteranceText.trim();
       if (!cleanText || isProcessingRef.current) return;
 
-      // Duplicate transcription suppression (Requirement 10)
+      // Duplicate debounce threshold: 700ms (allows legitimate repeated commands)
       const now = Date.now();
       if (
         lastProcessedUtteranceRef.current.text.toLowerCase() === cleanText.toLowerCase() &&
-        now - lastProcessedUtteranceRef.current.time < 2500
+        now - lastProcessedUtteranceRef.current.time < 700
       ) {
-        console.log("Suppressing duplicate voice utterance:", cleanText);
         return;
       }
       lastProcessedUtteranceRef.current = { text: cleanText, time: now };
 
-      // Clear any pending timers
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
         silenceTimerRef.current = null;
@@ -446,7 +449,8 @@ export default function VoiceAssistant({
 
       isProcessingRef.current = true;
       setState("PROCESSING");
-      setLiveTranscript(cleanText);
+      setConfirmedTranscript(cleanText);
+      setLiveTranscript("");
 
       const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       setSessionLogs((prev) => [
@@ -454,17 +458,23 @@ export default function VoiceAssistant({
         { id: String(Date.now()), sender: "user", text: cleanText, time: timeStr },
       ]);
 
-      // Stop speech recognizer temporarily during processing & speaking
       if (recognitionRef.current) {
         try {
+          recognitionRef.current.onstart = null;
+          recognitionRef.current.onspeechstart = null;
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.onend = null;
           recognitionRef.current.abort();
         } catch {
           // intentional no-op
         }
+        recognitionRef.current = null;
       }
 
       abortControllerRef.current = new AbortController();
       const turnId = `voice_${Date.now()}`;
+      const tFetchStart = Date.now();
 
       try {
         const authHeaders = await getAuthHeaders(apiUrl);
@@ -493,7 +503,11 @@ export default function VoiceAssistant({
           action?: string;
           lang?: string;
           fast_path?: boolean;
+          latency_ms?: number;
         };
+
+        const totalLatency = Date.now() - tFetchStart;
+        setLastLatencyMs(data.latency_ms || totalLatency);
 
         if (data.conversation_id) {
           conversationIdRef.current = data.conversation_id;
@@ -511,7 +525,6 @@ export default function VoiceAssistant({
         speakVoiceResponseRef.current(spokenAnswer, lang, isStopAction);
       } catch (err: unknown) {
         if (err instanceof Error && err.name === "AbortError") {
-          console.log("Voice request aborted by user.");
           return;
         }
         console.error("Voice process error:", err);
@@ -548,10 +561,16 @@ export default function VoiceAssistant({
 
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onstart = null;
+        recognitionRef.current.onspeechstart = null;
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
         recognitionRef.current.abort();
       } catch {
         // intentional no-op
       }
+      recognitionRef.current = null;
     }
 
     const recognition = new SpeechRecClass();
@@ -583,35 +602,39 @@ export default function VoiceAssistant({
         }
       }
 
-      // If browser detected final end of sentence: SUBMIT IMMEDIATELY! NO WAITING!
-      if (finalStr.trim()) {
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = null;
-        }
-        transcriptBufferRef.current = "";
-        void processVoiceUtteranceRef.current(finalStr.trim());
-        return;
-      }
-
-      // If user is currently speaking: display live words and set quick 650ms silence fallback
+      // Display live interim speech while user speaks
       if (interim.trim()) {
         setState("TRANSCRIBING");
-        setLiveTranscript(interim);
+        setLiveTranscript(interim.trim());
         transcriptBufferRef.current = interim.trim();
 
         if (silenceTimerRef.current) {
           clearTimeout(silenceTimerRef.current);
         }
 
-        // Quick 650ms VAD silence timeout
+        // 600ms VAD silence timeout for interim speech
         silenceTimerRef.current = setTimeout(() => {
           const textToSubmit = transcriptBufferRef.current;
           transcriptBufferRef.current = "";
           if (textToSubmit && !isProcessingRef.current && !isSpeakingRef.current) {
+            setConfirmedTranscript(textToSubmit);
+            setLiveTranscript("");
             void processVoiceUtteranceRef.current(textToSubmit);
           }
-        }, 650);
+        }, 600);
+      }
+
+      // When browser detects final end of sentence: submit immediately
+      if (finalStr.trim()) {
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
+        transcriptBufferRef.current = "";
+        setConfirmedTranscript(finalStr.trim());
+        setLiveTranscript("");
+        void processVoiceUtteranceRef.current(finalStr.trim());
+        return;
       }
     };
 
@@ -624,11 +647,21 @@ export default function VoiceAssistant({
         return;
       }
       if (event.error === "audio-capture") {
-        setSpokenStatusText("Microphone busy or not detected. Please verify your audio input settings.");
+        setSpokenStatusText("Microphone temporarily busy. Reconnecting...");
+        setTimeout(() => {
+          if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+            resumeListeningRef.current();
+          }
+        }, 400);
         return;
       }
       if (event.error === "network") {
-        setSpokenStatusText("Speech recognition network error. Please check your connection.");
+        setSpokenStatusText("Speech recognition network error. Reconnecting...");
+        setTimeout(() => {
+          if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+            resumeListeningRef.current();
+          }
+        }, 400);
         return;
       }
     };
@@ -639,7 +672,7 @@ export default function VoiceAssistant({
           if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
             resumeListeningRef.current();
           }
-        }, 150);
+        }, 200);
       }
     };
 
@@ -675,10 +708,16 @@ export default function VoiceAssistant({
       if (ttsSafetyTimerRef.current) clearTimeout(ttsSafetyTimerRef.current);
       if (recognitionRef.current) {
         try {
+          recognitionRef.current.onstart = null;
+          recognitionRef.current.onspeechstart = null;
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.onend = null;
           recognitionRef.current.abort();
         } catch {
           // intentional no-op
         }
+        recognitionRef.current = null;
       }
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
       releaseAudioAnalyser();
@@ -740,18 +779,21 @@ export default function VoiceAssistant({
         {/* Live Audio Frequency Oscilloscope Canvas */}
         <canvas ref={canvasRef} className="waveform-canvas" width={380} height={44} />
 
+        {/* User's Recognized Spoken Transcript Display (Task A) */}
+        {(liveTranscript || confirmedTranscript) && (
+          <div className="voice-user-transcript-bubble">
+            <span className="transcript-prefix">{liveTranscript ? "🎙️ Hearing:" : "🗣️ You said:"}</span>
+            <span className="transcript-body">{liveTranscript || confirmedTranscript}</span>
+          </div>
+        )}
+
         {/* Status / Speech Output Bubble */}
         <div className="voice-status-display">
           <p className="status-main-text">{spokenStatusText}</p>
+          {lastLatencyMs !== null && (
+            <span className="latency-indicator">⚡ {lastLatencyMs}ms turnaround</span>
+          )}
         </div>
-
-        {/* Live Speech Recognition Transcription Preview */}
-        {liveTranscript && (
-          <div className="live-transcript-bubble">
-            <span className="transcript-icon">🎙️</span>
-            <span className="transcript-text">{liveTranscript}</span>
-          </div>
-        )}
       </div>
 
       {/* Master Session Controls */}
@@ -798,14 +840,15 @@ export default function VoiceAssistant({
       {/* Fast Voice Command Examples */}
       <div className="quick-actions-tray">
         <span className="quick-label">Try Speaking:</span>
-        <button onClick={() => { void processVoiceUtterance("open chrome"); }}>"Open Chrome"</button>
-        <button onClick={() => { void processVoiceUtterance("open camera"); }}>"Open Camera"</button>
         <button onClick={() => { void processVoiceUtterance("open calculator"); }}>"Open Calculator"</button>
-        <button onClick={() => { void processVoiceUtterance("who am i"); }}>"Who am I?"</button>
-        <button onClick={() => { void processVoiceUtterance("battery kitni hai"); }}>"Battery kitni hai?"</button>
-        <button onClick={() => { void processVoiceUtterance("volume up"); }}>"Volume up"</button>
-        <button onClick={() => { void processVoiceUtterance("open my latest pdf"); }}>"Open my latest PDF"</button>
-        <button onClick={() => { void processVoiceUtterance("search for AI internships"); }}>"Search for AI internships"</button>
+        <button onClick={() => { void processVoiceUtterance("open chrome"); }}>"Open Chrome"</button>
+        <button onClick={() => { void processVoiceUtterance("open youtube"); }}>"Open YouTube"</button>
+        <button onClick={() => { void processVoiceUtterance("open youtube in chrome"); }}>"Open YouTube in Chrome"</button>
+        <button onClick={() => { void processVoiceUtterance("Mere laptop ki RAM kitni use ho rahi hai?"); }}>"RAM kitni use ho rahi hai?"</button>
+        <button onClick={() => { void processVoiceUtterance("How much free space is available?"); }}>"How much free space?"</button>
+        <button onClick={() => { void processVoiceUtterance("Find my Phone Doctor project"); }}>"Find Phone Doctor"</button>
+        <button onClick={() => { void processVoiceUtterance("open it"); }}>"Open it"</button>
+        <button onClick={() => { void processVoiceUtterance("Which project did I just ask you about?"); }}>"Which project did I ask about?"</button>
         <button onClick={() => { void processVoiceUtterance("stop listening"); }}>"Stop listening"</button>
       </div>
 

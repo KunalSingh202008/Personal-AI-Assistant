@@ -227,9 +227,19 @@ class IntentEngine:
             resolved_lower = resolved_text.lower()
             logger.info("Resolved pronoun '%s' -> '%s' (type: %s)", query, resolved_text, pronoun_meta.get("target_type"))
 
-            # Resolved to project execution
+            # Resolved to project execution or opening
             if pronoun_meta.get("target_type") == "project":
                 proj = pronoun_meta["resolved_target"]
+                if "open folder" in resolved_lower or "open" in lower or "kholo" in lower:
+                    return IntentResult(
+                        intent_type="ACTION",
+                        tool_name="open_folder",
+                        parameters={"folder_path": proj.get("path")},
+                        confidence=0.98,
+                        language=lang,
+                        resolved_entity=proj,
+                        fast_path=True,
+                    )
                 return IntentResult(
                     intent_type="ACTION",
                     tool_name="run_project",
@@ -336,8 +346,10 @@ class IntentEngine:
                 fast_path=True,
             )
 
-        # System Hardware & Telemetry
-        if re.search(r'\b(ram usage|ram kitna|memory usage|what is my laptop\'?s? ram|pc ka ram|how much ram)\b', lower) or (
+        # System Hardware, RAM & Telemetry
+        if (
+            re.search(r'\b(ram|memory)\b', lower) and re.search(r'\b(use|using|used|kitni|kitna|usage|free|available|consumption|status|batao|check)\b', lower)
+        ) or re.search(r'\b(ram usage|ram kitna|ram kitni|memory usage|what is my laptop\'?s? ram|pc ka ram|how much ram|laptop ki ram)\b', lower) or (
             re.search(r'\b(system metrics|system status|performance|pc ka haal|cpu usage)\b', lower)
         ):
             return IntentResult(
@@ -360,11 +372,9 @@ class IntentEngine:
             )
 
         # Disk Space & Storage Utilization
-        if re.search(r'\b(free space|disk space|storage space|hard drive|free storage|space available|kitna space|space kitna|kitna storage|storage kitna|free disk|how much storage|storage left|storage remaining|storage available)\b', lower) or (
-            re.search(r'\b(drive)\b', lower) and re.search(r'\b(free|space|capacity|most|storage)\b', lower)
-        ) or (
-            re.search(r'\b(storage|disk)\b', lower) and re.search(r'\b(how much|how many|kitna|left|remaining|available)\b', lower)
-        ):
+        if (
+            re.search(r'\b(space|storage|disk|hard drive|drive)\b', lower) and re.search(r'\b(free|khali|available|left|bachi|bacha|capacity|most|kitni|kitna|how much|check|batao)\b', lower)
+        ) or re.search(r'\b(free space|disk space|storage space|hard drive|free storage|space available|kitna space|space kitna|kitna storage|storage kitna|free disk|how much storage|storage left|storage remaining|storage available|space khali|khali space)\b', lower):
             target_drive = None
             d_match = re.search(r'\b([c-zC-Z])\s*(?:drive|:)\b', query)
             if d_match:
@@ -400,36 +410,88 @@ class IntentEngine:
                 fast_path=True,
             )
 
-        # Open Folder
-        folder_open_match = re.search(r'\b(?:open|kholo)\s+(?:the\s+|my\s+)?([a-zA-Z0-9_\- ]+?)\s+folder\b', lower) or (
+        # Open Project / Open Folder / Open File / Open Path
+        open_folder_prefix = re.search(r'\b(?:open|kholo)\s+(?:the\s+|my\s+)?folder\s+([a-zA-Z0-9_\-:\\/ ]+)', lower)
+        open_file_prefix = re.search(r'\b(?:open|kholo)\s+(?:the\s+|my\s+)?file\s+([a-zA-Z0-9_\-:\\/ \.]+)', lower)
+        open_project_prefix = re.search(r'\b(?:open|kholo)\s+(?:the\s+|my\s+)?project\s+([a-zA-Z0-9_\-:\\/ ]+)', lower)
+        folder_suffix_match = re.search(r'\b(?:open|kholo)\s+(?:the\s+|my\s+)?([a-zA-Z0-9_\- ]+?)\s+folder\b', lower) or (
             re.search(r'\b(?:open|kholo)\s+(downloads|documents|desktop|videos|music|pictures)\b', lower)
         )
-        if folder_open_match:
-            folder_name = folder_open_match.group(1).strip()
-            if folder_name in {"this", "the", "that"}:
+
+        if open_file_prefix:
+            f_cand = open_file_prefix.group(1).strip()
+            ctx = entity_tracker.get_context(conversation_id) if conversation_id else {}
+            if ctx.get("last_file") and f_cand.lower() == ctx["last_file"].get("path", "").lower():
+                f_cand = ctx["last_file"]["path"]
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="open_file_path",
+                parameters={"file_path": f_cand},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        target_folder = None
+        if open_folder_prefix:
+            target_folder = open_folder_prefix.group(1).strip()
+        elif open_project_prefix:
+            p_cand = open_project_prefix.group(1).strip()
+            ctx = entity_tracker.get_context(conversation_id)
+            if p_cand in {"this", "the", "that", "it"} and ctx.get("last_project"):
+                target_folder = ctx["last_project"].get("path")
+            elif ctx.get("last_project") and p_cand.lower() in ctx["last_project"].get("name", "").lower():
+                target_folder = ctx["last_project"].get("path")
+            else:
+                target_folder = p_cand
+        elif folder_suffix_match:
+            target_folder = folder_suffix_match.group(1).strip()
+
+        if target_folder:
+            if target_folder in {"this", "the", "that", "it"}:
                 ctx = entity_tracker.get_context(conversation_id)
                 if ctx.get("last_project"):
-                    folder_name = ctx["last_project"].get("path") or ctx["last_project"].get("name")
+                    target_folder = ctx["last_project"].get("path")
+                elif ctx.get("last_folder"):
+                    target_folder = ctx["last_folder"].get("path")
                 elif ctx.get("last_file"):
-                    folder_name = ctx["last_file"].get("path", "")
-            if folder_name:
+                    target_folder = ctx["last_file"].get("path")
+            if target_folder:
                 return IntentResult(
                     intent_type="ACTION",
                     tool_name="open_folder",
-                    parameters={"folder_path": folder_name},
+                    parameters={"folder_path": target_folder},
                     confidence=0.98,
                     language=lang,
                     fast_path=True,
                 )
 
+        # Project Inquiry ("Which project did I just ask you about?")
+        if re.search(r'\b(which project|what project|kaun sa project|project.*(ask|pucha|baare mein))\b', lower):
+            ctx = entity_tracker.get_context(conversation_id) if conversation_id else {}
+            last_proj = ctx.get("last_project")
+            if last_proj:
+                pname = last_proj.get("name", "project")
+                ppath = last_proj.get("path", "")
+                resp = f"Aapne {pname} project ke baare mein pucha tha (path: {ppath})." if lang == "hinglish" else f"You asked about the {pname} project at {ppath}."
+            else:
+                resp = "Aapne abhi tak kisi project ke baare mein nahi pucha." if lang == "hinglish" else "You haven't asked about any specific project in this session yet."
+            return IntentResult(
+                intent_type="QUESTION",
+                tool_name="project_inquiry",
+                response_text=resp,
+                language=lang,
+                fast_path=True,
+            )
+
         # Previous Question / Reflection
-        if re.search(r'\b(what did i ask|what was my last question|previous question|pichla sawal|pehle kya pucha)\b', lower):
+        if re.search(r'\b(what did i ask|what was my (?:last|previous) question|previous question|pichla sawal|pichhla sawal|pehle kya (?:pucha|poocha|puchha)|maine pehle kya (?:pucha|poocha|puchha))\b', lower):
             from core.conversation_manager import conversation_manager
             db_msgs = conversation_manager.get_messages(conversation_id) if conversation_id else []
             user_msgs = [m for m in db_msgs if m.get("role") == "user"]
             candidates = [
                 m for m in user_msgs
-                if not re.search(r'\b(what did i ask|last question|previous question|pichla sawal|pehle kya pucha)\b', m.get("content", "").lower())
+                if not re.search(r'\b(what did i ask|last question|previous question|pichla sawal|pehle kya (?:pucha|poocha|puchha))\b', m.get("content", "").lower())
             ]
             if candidates:
                 last_q = candidates[-1]["content"]
@@ -501,7 +563,30 @@ class IntentEngine:
                 fast_path=True,
             )
 
-        if re.search(r'\b(chrome|google chrome|browser)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
+        # YouTube in Chrome
+        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(chrome)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "open youtube in chrome"},
+                confidence=0.99,
+                language=lang,
+                fast_path=True,
+            )
+
+        # YouTube
+        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(open|launch|play|kholo|chalao)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "youtube"},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Chrome
+        if re.search(r'\b(chrome|google chrome)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
             return IntentResult(
                 intent_type="ACTION",
                 tool_name="launch_app",
@@ -511,31 +596,12 @@ class IntentEngine:
                 fast_path=True,
             )
 
-        if re.search(r'\b(vscode|vs code|code editor)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
+        # Generic Browser
+        if re.search(r'\b(browser)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
             return IntentResult(
                 intent_type="ACTION",
                 tool_name="launch_app",
-                parameters={"app_name": "vscode"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        if re.search(r'\b(notepad|editor)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "notepad"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(open|launch|play|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "youtube"},
+                parameters={"app_name": "browser"},
                 confidence=0.98,
                 language=lang,
                 fast_path=True,
@@ -682,16 +748,23 @@ class IntentEngine:
         # 1. Application Launch
         if tool_name in {"launch_app", "launch_calculator", "launch_camera", "launch_notepad", "launch_chrome", "launch_vscode", "launch_youtube"}:
             app = params.get("app_name") or params.get("app") or tool_name.replace("launch_", "")
+            res_obj = result.get("result", {})
+            msg = res_obj.get("message") or result.get("message")
             app_display = app.capitalize()
-            if status == "success":
+            if status == "success" or res_obj.get("status") == "success":
+                if "youtube" in app.lower():
+                    if lang == "hinglish":
+                        return "YouTube browser mein khol diya hai."
+                    return "Opened YouTube in your browser."
                 if lang == "hinglish":
                     return f"{app_display} khol diya hai."
                 return f"Opening {app_display}."
             else:
-                msg = result.get("message") or result.get("result", {}).get("message", "Application could not be launched.")
+                if msg:
+                    return msg
                 if lang == "hinglish":
-                    return f"{app_display} launch nahi ho saka: {msg}"
-                return f"Failed to open {app_display}: {msg}"
+                    return f"{app_display} launch nahi ho saka."
+                return f"Failed to open {app_display}."
 
         # 2. Application Close
         if tool_name == "close_app":
@@ -712,13 +785,14 @@ class IntentEngine:
             ram_pct = metrics.get("ram_usage_percent", 50)
             used_mb = metrics.get("used_ram_mb", 8192)
             total_mb = metrics.get("total_ram_mb", 16384)
-            used_gb = used_mb / 1024.0
-            total_gb = total_mb / 1024.0
-            battery_pct = metrics.get("battery_percent", 90)
+            free_mb = metrics.get("free_ram_mb", max(0, total_mb - used_mb))
+            used_gb = metrics.get("used_ram_gb") or round(used_mb / 1024.0, 1)
+            total_gb = metrics.get("total_ram_gb") or round(total_mb / 1024.0, 1)
+            free_gb = metrics.get("free_ram_gb") or round(free_mb / 1024.0, 1)
 
             if lang == "hinglish":
-                return f"Aapke laptop ka RAM usage {ram_pct}% hai ({used_gb:.1f} GB of {total_gb:.1f} GB used)."
-            return f"Your laptop's RAM usage is currently {ram_pct}% ({used_gb:.1f} GB of {total_gb:.1f} GB used)."
+                return f"Aapke laptop ka RAM usage abhi {ram_pct}% hai ({used_gb:.1f} GB use ho rahi hai kul {total_gb:.1f} GB mein se, aur {free_gb:.1f} GB free bachi hai)."
+            return f"Your laptop is currently using {used_gb:.1f} GB of RAM out of {total_gb:.1f} GB total ({ram_pct}% RAM usage), with {free_gb:.1f} GB available."
 
         # 3b. Disk Space & Storage Utilization
         if tool_name == "get_disk_space":
@@ -735,8 +809,9 @@ class IntentEngine:
                 free_gb = d.get("free_gb", 0)
                 tot_gb = d.get("total_gb", 0)
                 used_pct = d.get("used_percent", 0)
-                parts_en.append(f"{d_name} has {free_gb} GB free out of {tot_gb} GB ({used_pct}% used)")
-                parts_hi.append(f"{d_name} mein {free_gb} GB free hai {tot_gb} GB mein se ({used_pct}% used)")
+                free_pct = d.get("free_percent", round(100.0 - used_pct, 1))
+                parts_en.append(f"{d_name} has {free_gb} GB free out of {tot_gb} GB total ({used_pct}% used, {free_pct}% available)")
+                parts_hi.append(f"{d_name} drive mein {free_gb} GB free space hai {tot_gb} GB total mein se ({used_pct}% used, {free_pct}% khali)")
 
             summary_str_en = ". ".join(parts_en) + "."
             summary_str_hi = ". ".join(parts_hi) + "."

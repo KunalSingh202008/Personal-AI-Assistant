@@ -97,7 +97,7 @@ class KelaEngine:
             intent = intent_engine.classify_intent(last_user_message, conversation_id=conversation_id)
 
             if intent.intent_type in {"SESSION_CONTROL"} or (
-                intent.intent_type == "QUESTION" and intent.tool_name == "reflection" and intent.response_text
+                intent.intent_type == "QUESTION" and intent.tool_name in {"reflection", "project_inquiry"} and intent.response_text
             ):
                 resp = intent.response_text
                 yield ndjson({"token": resp})
@@ -351,6 +351,8 @@ class KelaEngine:
         permission management, tool risk checking, and provider fallback.
         """
         from voice.router import resolve_voice_intent, execute_voice_action, is_wake_word_present, detect_language
+        import time
+        t_voice_start = time.perf_counter()
 
         clean_text = text.strip()
         _, stripped_query = is_wake_word_present(clean_text)
@@ -417,6 +419,7 @@ class KelaEngine:
                     "lang": lang,
                     "stop_session": intent.get("stop_session", False),
                     "pause_session": intent.get("pause_session", False),
+                    "latency_ms": round((time.perf_counter() - t_voice_start) * 1000, 2),
                 }
 
             # Handle Clarification Requests
@@ -612,6 +615,7 @@ class KelaEngine:
                 "stop_session": exec_result.get("stop_session", False),
                 "pause_session": exec_result.get("pause_session", False),
                 "data": exec_result.get("data"),
+                "latency_ms": round((time.perf_counter() - t_voice_start) * 1000, 2),
             }
 
         except Exception as err:

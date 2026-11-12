@@ -31,11 +31,13 @@ class EntityTracker:
         conversation_id: Optional[int],
         last_project: Optional[Dict[str, Any]] = None,
         last_file: Optional[Dict[str, Any]] = None,
+        last_folder: Optional[Dict[str, Any]] = None,
         last_app: Optional[str] = None,
         last_query: Optional[str] = None,
         last_action: Optional[str] = None,
         last_result: Optional[Any] = None,
         last_language: Optional[str] = None,
+        last_entity_type: Optional[str] = None,
     ):
         if conversation_id is None:
             return
@@ -47,6 +49,8 @@ class EntityTracker:
                 st["last_project"] = last_project
             if last_file is not None:
                 st["last_file"] = last_file
+            if last_folder is not None:
+                st["last_folder"] = last_folder
             if last_app is not None:
                 st["last_app"] = last_app
             if last_query is not None:
@@ -57,6 +61,8 @@ class EntityTracker:
                 st["last_result"] = last_result
             if last_language is not None:
                 st["last_language"] = last_language
+            if last_entity_type is not None:
+                st["last_entity_type"] = last_entity_type
 
     def update_from_action_result(
         self,
@@ -86,6 +92,7 @@ class EntityTracker:
                     app = action_name[len("launch_"):]
                 if app:
                     st["last_app"] = app
+                    st["last_entity_type"] = "app"
 
             # Search operations
             elif action_name == "search_user_files":
@@ -101,6 +108,7 @@ class EntityTracker:
                         "path": projects[0]["path"],
                         "folder": projects[0].get("folder"),
                     }
+                    st["last_entity_type"] = "project"
                 files = [r for r in res_list if r.get("type") == "file"]
                 if files:
                     st["last_file"] = {
@@ -108,8 +116,10 @@ class EntityTracker:
                         "path": files[0]["path"],
                         "folder": files[0].get("folder"),
                     }
+                    if not projects:
+                        st["last_entity_type"] = "file"
 
-            elif action_name == "find_resume_files":
+            elif action_name in {"find_resume_files", "find_resume"}:
                 res_list = result if isinstance(result, list) else result.get("results", [])
                 if res_list:
                     st["last_file"] = {
@@ -117,6 +127,16 @@ class EntityTracker:
                         "path": res_list[0]["path"],
                         "folder": res_list[0].get("folder"),
                     }
+                    st["last_entity_type"] = "file"
+
+            elif action_name == "open_folder":
+                fpath = result.get("path") or params.get("folder_path", "")
+                if fpath:
+                    st["last_folder"] = {
+                        "name": os.path.basename(fpath),
+                        "path": fpath,
+                    }
+                    st["last_entity_type"] = "folder"
 
             elif action_name == "open_file_path":
                 fpath = params.get("file_path", "")
@@ -125,6 +145,7 @@ class EntityTracker:
                         "name": os.path.basename(fpath),
                         "path": fpath,
                     }
+                    st["last_entity_type"] = "file"
 
     def resolve_pronouns(
         self,
@@ -147,18 +168,16 @@ class EntityTracker:
             "target_type": None,
         }
 
-        # Common pronoun phrases
-        # 1. "run it" / "start it" / "execute it" / "chalao ise" / "ise run karo" / "run that project"
+        # 1. "run it" / "start it" / "execute it" / "run this project" / "chalao ise"
         run_pronoun_match = re.search(
-            r'\b(?:run|start|execute|launch|chalao|kholo)\s+(?:it|that|this|the project|that project|ise|isko|usko)\b',
+            r'\b(?:run|start|execute|launch|chalao)\s+(?:it|that|this|the project|that project|this project|ise|isko|usko)\b',
             lower
         ) or re.search(
-            r'\b(?:ise|isko|usko)\s+(?:run karo|chalao|kholo|start karo)\b',
+            r'\b(?:ise|isko|usko)\s+(?:run karo|chalao|start karo)\b',
             lower
-        ) or lower in {"run it", "start it", "chalao ise", "ise chalao", "run that", "run project", "run the project"}
+        ) or lower in {"run it", "start it", "chalao ise", "ise chalao", "run that", "run project", "run the project", "run this project"}
 
         if run_pronoun_match:
-            # Check for project first
             if ctx.get("last_project"):
                 proj = ctx["last_project"]
                 resolved_text = f"run project {proj['name']}"
@@ -174,17 +193,32 @@ class EntityTracker:
                 meta["target_type"] = "app"
                 return resolved_text, meta
 
-        # 2. "open it" / "kholo ise" / "open that" / "open the file" / "open the document"
+        # 2. "open it" / "kholo ise" / "open that" / "open the file" / "open the document" / "open the project"
         open_pronoun_match = re.search(
-            r'\b(?:open|kholo|dekho|view)\s+(?:it|that|this|the file|that file|the document|ise|isko|usko)\b',
+            r'\b(?:open|kholo|dekho|view)\s+(?:it|that|this|the file|that file|the document|the project|this project|ise|isko|usko)\b',
             lower
         ) or re.search(
             r'\b(?:ise|isko|usko)\s+(?:kholo|open karo|dekho)\b',
             lower
-        ) or lower in {"open it", "kholo ise", "ise kholo", "open that", "open the file"}
+        ) or lower in {"open it", "kholo ise", "ise kholo", "open that", "open the file", "open the project", "open this project"}
 
         if open_pronoun_match:
-            if ctx.get("last_file"):
+            entity_type = ctx.get("last_entity_type")
+            if entity_type == "project" and ctx.get("last_project"):
+                proj = ctx["last_project"]
+                resolved_text = f"open folder {proj['path']}"
+                meta["resolved"] = True
+                meta["resolved_target"] = proj
+                meta["target_type"] = "project"
+                return resolved_text, meta
+            elif entity_type == "folder" and ctx.get("last_folder"):
+                f = ctx["last_folder"]
+                resolved_text = f"open folder {f['path']}"
+                meta["resolved"] = True
+                meta["resolved_target"] = f
+                meta["target_type"] = "folder"
+                return resolved_text, meta
+            elif entity_type == "file" and ctx.get("last_file"):
                 f = ctx["last_file"]
                 resolved_text = f"open file {f['path']}"
                 meta["resolved"] = True
@@ -193,10 +227,24 @@ class EntityTracker:
                 return resolved_text, meta
             elif ctx.get("last_project"):
                 proj = ctx["last_project"]
-                resolved_text = f"open project {proj['name']}"
+                resolved_text = f"open folder {proj['path']}"
                 meta["resolved"] = True
                 meta["resolved_target"] = proj
                 meta["target_type"] = "project"
+                return resolved_text, meta
+            elif ctx.get("last_folder"):
+                f = ctx["last_folder"]
+                resolved_text = f"open folder {f['path']}"
+                meta["resolved"] = True
+                meta["resolved_target"] = f
+                meta["target_type"] = "folder"
+                return resolved_text, meta
+            elif ctx.get("last_file"):
+                f = ctx["last_file"]
+                resolved_text = f"open file {f['path']}"
+                meta["resolved"] = True
+                meta["resolved_target"] = f
+                meta["target_type"] = "file"
                 return resolved_text, meta
             elif ctx.get("last_app"):
                 app = ctx["last_app"]
