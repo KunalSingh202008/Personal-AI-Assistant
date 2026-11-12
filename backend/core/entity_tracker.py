@@ -26,6 +26,16 @@ class EntityTracker:
         with self._lock:
             return dict(self._state.get(conversation_id, {}))
 
+    def update_context(self, conversation_id: Optional[int], **kwargs):
+        if conversation_id is None:
+            return
+        with self._lock:
+            if conversation_id not in self._state:
+                self._state[conversation_id] = {}
+            for k, v in kwargs.items():
+                if v is not None:
+                    self._state[conversation_id][k] = v
+
     def update_entities(
         self,
         conversation_id: Optional[int],
@@ -147,6 +157,60 @@ class EntityTracker:
                     }
                     st["last_entity_type"] = "file"
 
+            elif action_name == "launch_browser":
+                b_name = params.get("browser_name") or result.get("browser", "Browser")
+                st["last_app"] = b_name
+                st["last_entity_type"] = "app"
+
+            elif action_name == "find_large_files":
+                files = result.get("files", []) if isinstance(result, dict) else []
+                if files:
+                    st["last_large_files"] = files
+                    st["last_file"] = {
+                        "name": files[0]["name"],
+                        "path": files[0]["path"],
+                        "size_mb": files[0].get("size_mb"),
+                    }
+                    st["last_entity_type"] = "file"
+
+            elif action_name == "find_duplicate_files":
+                groups = result.get("duplicate_groups", []) if isinstance(result, dict) else []
+                if groups and groups[0].get("files"):
+                    first_file = groups[0]["files"][0]
+                    st["last_file"] = {
+                        "name": first_file["filename"],
+                        "path": first_file["path"],
+                        "size_mb": groups[0].get("size_mb"),
+                        "category": "Duplicate",
+                    }
+                    st["last_storage_candidates"] = [f for g in groups for f in g.get("files", [])]
+                    st["last_entity_type"] = "file"
+
+            elif action_name == "analyze_storage_cleanup":
+                candidates = result.get("all_candidates") or (result.get("safe_cleanup_candidates", []) + result.get("review_candidates", []))
+                if candidates:
+                    st["last_storage_candidates"] = candidates
+                    st["last_file"] = {
+                        "name": candidates[0].get("name"),
+                        "path": candidates[0].get("path"),
+                        "size_mb": candidates[0].get("size_mb"),
+                        "category": candidates[0].get("category"),
+                        "risk": candidates[0].get("risk"),
+                        "reason": candidates[0].get("reason"),
+                    }
+                    st["last_entity_type"] = "file"
+
+            elif action_name == "analyze_project_folder":
+                st["last_project"] = {
+                    "name": result.get("project_name"),
+                    "path": result.get("project_path"),
+                }
+                st["last_entity_type"] = "project"
+                st["last_project_analysis"] = result
+
+            elif action_name == "plan_system_diagnosis":
+                st["last_diagnosis"] = result
+
     def resolve_pronouns(
         self,
         text: str,
@@ -191,6 +255,16 @@ class EntityTracker:
                 meta["resolved"] = True
                 meta["resolved_target"] = app
                 meta["target_type"] = "app"
+                return resolved_text, meta
+
+        # 2b. "analyse this project's folder" / "analyse this project"
+        if re.search(r'\b(?:analyse|analyze|inspect|check)\s+(?:this|the|that)?\s*project(?:\'s)?\s*(?:folder)?\b', lower):
+            if ctx.get("last_project"):
+                proj = ctx["last_project"]
+                resolved_text = f"analyse project {proj.get('path') or proj.get('name')}"
+                meta["resolved"] = True
+                meta["resolved_target"] = proj
+                meta["target_type"] = "project"
                 return resolved_text, meta
 
         # 2. "open it" / "kholo ise" / "open that" / "open the file" / "open the document" / "open the project"
@@ -252,6 +326,16 @@ class EntityTracker:
                 meta["resolved"] = True
                 meta["resolved_target"] = app
                 meta["target_type"] = "app"
+                return resolved_text, meta
+
+        # 2b. "analyse this project's folder" / "analyse this project"
+        if re.search(r'\b(?:analyse|analyze|inspect|check)\s+(?:this|the|that)?\s*project(?:\'s)?\s*(?:folder)?\b', lower):
+            if ctx.get("last_project"):
+                proj = ctx["last_project"]
+                resolved_text = f"analyse project {proj.get('path') or proj.get('name')}"
+                meta["resolved"] = True
+                meta["resolved_target"] = proj
+                meta["target_type"] = "project"
                 return resolved_text, meta
 
         # 3. "close it" / "band karo ise" / "close that"

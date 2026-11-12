@@ -230,6 +230,16 @@ class IntentEngine:
             # Resolved to project execution or opening
             if pronoun_meta.get("target_type") == "project":
                 proj = pronoun_meta["resolved_target"]
+                if "analyse project" in resolved_lower or "analyze project" in resolved_lower:
+                    return IntentResult(
+                        intent_type="ACTION",
+                        tool_name="analyze_project_folder",
+                        parameters={"project_path_or_name": proj.get("path") or proj.get("name")},
+                        confidence=0.98,
+                        language=lang,
+                        resolved_entity=proj,
+                        fast_path=True,
+                    )
                 if "open folder" in resolved_lower or "open" in lower or "kholo" in lower:
                     return IntentResult(
                         intent_type="ACTION",
@@ -271,6 +281,27 @@ class IntentEngine:
                 )
 
         # -------------------------------------------------------------
+        # Conversational Follow-up Check
+        # -------------------------------------------------------------
+        ctx = entity_tracker.get_context(conversation_id) if conversation_id else {}
+        from pc_control.task_planner import task_planner
+        followup_res = task_planner.handle_followup(query, ctx, lang=lang)
+        if followup_res and followup_res.get("handled"):
+            if followup_res.get("selected_entity"):
+                entity_tracker.update_context(
+                    conversation_id,
+                    last_file=followup_res.get("selected_entity") if followup_res.get("entity_type") == "file" else None,
+                    last_entity_type=followup_res.get("entity_type", "file"),
+                )
+            return IntentResult(
+                intent_type="QUESTION",
+                tool_name="followup",
+                response_text=followup_res["response_text"],
+                language=lang,
+                fast_path=True,
+            )
+
+        # -------------------------------------------------------------
         # Ambiguity Checks (When user uses bare pronouns with no context)
         # -------------------------------------------------------------
         if re.search(r'^(?:run it|start it|chalao ise|ise chalao|execute it)$', lower):
@@ -302,6 +333,22 @@ class IntentEngine:
                 language=lang,
                 fast_path=True,
             )
+
+        # File Deletion / Safe Recycle (Safely Classified as RED risk by ToolRegistry)
+        if not re.search(r'\b(which|what|can i|kaun|kya|batao|how)\b', lower):
+            del_match = re.search(r'\b(?:delete|remove|recycle|hatao|mitao)\s+(?:file|the file)\s+["\']?([^"\']+)["\']?', query, re.IGNORECASE)
+            if not del_match:
+                del_match = re.search(r'^(?:please\s+|kripya\s+)?(?:delete|remove|recycle)\s+["\']?([a-zA-Z0-9_\-\.\\\/: ]+\.[a-zA-Z0-9_]+)["\']?', query, re.IGNORECASE)
+            if del_match:
+                target_del = del_match.group(1).strip()
+                if target_del.lower() not in {"it", "that", "ise", "usko", "this", "my", "the"}:
+                    return IntentResult(
+                        intent_type="ACTION",
+                        tool_name="recycle_file_safely",
+                        parameters={"file_path": target_del, "target_path": target_del},
+                        language=lang,
+                        fast_path=True,
+                    )
 
         # -------------------------------------------------------------
         # Tier 1: Deterministic Semantic Patterns
@@ -370,6 +417,77 @@ class IntentEngine:
                 language=lang,
                 fast_path=True,
             )
+
+        # Which drive is almost full?
+        if re.search(r'\b(which drives?|kaun sa drive|kaun se drives?|which partitions?|konsa drive)\b', lower) and re.search(r'\b(full|almost full|bhar gaya|bhari|space kam)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="get_disk_space",
+                parameters={"almost_full_only": True},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Multi-step Slowness & Performance Diagnostic
+        if (
+            re.search(r'\b(slow|lag|hang|atatak|bottleneck|performance issue|kyu chal raha hai|suggest improvements)\b', lower)
+            and re.search(r'\b(laptop|pc|computer|system|check|analyse|analyze|batao)\b', lower)
+        ) or re.search(r'\b(analyse my laptop and suggest improvements|check my laptop and tell me why it is slow|why is my pc slow|laptop slow kyu hai)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="plan_system_diagnosis",
+                parameters={},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Storage Analysis & Unnecessary Files Discovery
+        if (
+            re.search(r'\b(unnecessary|cleanup|clean up|cleaned up|clean|safely review|free up space|junk|clear space)\b', lower)
+            and re.search(r'\b(files|storage|disk|laptop|pc|space)\b', lower)
+        ) or re.search(r'\b(which files are unnecessary|which files can i safely review|safely review for cleanup|safely delete|kaun se files delete kar sakte hain|unnecessary files batao)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="analyze_storage_cleanup",
+                parameters={},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Find Duplicate Files
+        if re.search(r'\b(duplicate|duplicates|duplicate files|duplicate copies|ek jaisi files)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="find_duplicate_files",
+                parameters={"max_results": 10},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Project Folder Analysis ("Analyse this project's folder" / "analyse project <name>")
+        project_analysis_match = re.search(r'\b(?:analyse|analyze|inspect|check)\s+(?:the\s+|this\s+)?project(?:\'s)?\s*(?:folder)?\s*([a-zA-Z0-9_\-:\\/ ]*)', lower)
+        if project_analysis_match and not re.search(r'\b(?:laptop|pc|computer|disk|storage)\b', lower):
+            p_arg = project_analysis_match.group(1).strip()
+            if not p_arg or p_arg in {"this", "the", "that", "it", "'s", "this's"}:
+                ctx = entity_tracker.get_context(conversation_id) if conversation_id else {}
+                if ctx.get("last_project"):
+                    p_arg = ctx["last_project"].get("path") or ctx["last_project"].get("name")
+                else:
+                    from pathlib import Path
+                    p_arg = str(Path.cwd())
+            if p_arg:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="analyze_project_folder",
+                    parameters={"project_path_or_name": p_arg},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
 
         # Disk Space & Storage Utilization
         if (
@@ -563,12 +681,34 @@ class IntentEngine:
                 fast_path=True,
             )
 
+        # YouTube in Brave
+        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(brave)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "open youtube in brave", "browser_name": "brave", "url": "https://www.youtube.com"},
+                confidence=0.99,
+                language=lang,
+                fast_path=True,
+            )
+
         # YouTube in Chrome
         if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(chrome)\b', lower):
             return IntentResult(
                 intent_type="ACTION",
                 tool_name="launch_app",
-                parameters={"app_name": "open youtube in chrome"},
+                parameters={"app_name": "open youtube in chrome", "browser_name": "chrome", "url": "https://www.youtube.com"},
+                confidence=0.99,
+                language=lang,
+                fast_path=True,
+            )
+
+        # YouTube in Edge
+        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(edge)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "open youtube in edge", "browser_name": "edge", "url": "https://www.youtube.com"},
                 confidence=0.99,
                 language=lang,
                 fast_path=True,
@@ -579,18 +719,51 @@ class IntentEngine:
             return IntentResult(
                 intent_type="ACTION",
                 tool_name="launch_app",
-                parameters={"app_name": "youtube"},
+                parameters={"app_name": "youtube", "url": "https://www.youtube.com"},
                 confidence=0.98,
                 language=lang,
                 fast_path=True,
             )
 
-        # Chrome
+        # Brave Browser
+        if re.search(r'\b(brave|brave browser)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "brave", "browser_name": "brave"},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Edge Browser
+        if re.search(r'\b(edge|msedge|microsoft edge)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "edge", "browser_name": "edge"},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Chrome Browser
         if re.search(r'\b(chrome|google chrome)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
             return IntentResult(
                 intent_type="ACTION",
                 tool_name="launch_app",
-                parameters={"app_name": "chrome"},
+                parameters={"app_name": "chrome", "browser_name": "chrome"},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Firefox Browser
+        if re.search(r'\b(firefox|mozilla firefox)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_app",
+                parameters={"app_name": "firefox", "browser_name": "firefox"},
                 confidence=0.98,
                 language=lang,
                 fast_path=True,
@@ -745,26 +918,46 @@ class IntentEngine:
         params = intent.parameters
         status = result.get("status", "success")
 
-        # 1. Application Launch
-        if tool_name in {"launch_app", "launch_calculator", "launch_camera", "launch_notepad", "launch_chrome", "launch_vscode", "launch_youtube"}:
-            app = params.get("app_name") or params.get("app") or tool_name.replace("launch_", "")
-            res_obj = result.get("result", {})
+        # 1. Application Launch & Browsers
+        if tool_name in {"launch_app", "launch_calculator", "launch_camera", "launch_notepad", "launch_chrome", "launch_vscode", "launch_youtube", "launch_browser", "open_youtube"}:
+            res_obj = result.get("result") if isinstance(result.get("result"), dict) else result
             msg = res_obj.get("message") or result.get("message")
-            app_display = app.capitalize()
-            if status == "success" or res_obj.get("status") == "success":
-                if "youtube" in app.lower():
-                    if lang == "hinglish":
-                        return "YouTube browser mein khol diya hai."
-                    return "Opened YouTube in your browser."
-                if lang == "hinglish":
-                    return f"{app_display} khol diya hai."
-                return f"Opening {app_display}."
-            else:
+            browser = res_obj.get("browser") or params.get("browser_name")
+            app = browser or params.get("app_name") or params.get("app") or tool_name.replace("launch_", "").replace("open_", "")
+
+            if status == "error" or res_obj.get("status") == "error":
                 if msg:
                     return msg
+                app_display = "Microsoft Edge" if str(app).lower() in {"edge", "msedge", "microsoft edge"} else (str(app).capitalize())
                 if lang == "hinglish":
                     return f"{app_display} launch nahi ho saka."
                 return f"Failed to open {app_display}."
+
+            # Success
+            url_target = params.get("url") or res_obj.get("target")
+            raw_app_lower = (params.get("app_name") or "").lower()
+            raw_url_lower = str(url_target or "").lower()
+
+            if "youtube" in raw_app_lower or "youtube" in raw_url_lower or tool_name == "open_youtube":
+                b_target = browser or ("Brave" if "brave" in raw_app_lower else ("Microsoft Edge" if "edge" in raw_app_lower else ("Google Chrome" if "chrome" in raw_app_lower else None)))
+                if b_target:
+                    if lang == "hinglish":
+                        return f"{b_target} mein YouTube khol diya hai."
+                    return f"Opened YouTube in {b_target}."
+                if lang == "hinglish":
+                    return "YouTube browser mein khol diya hai."
+                return "Opened YouTube in your browser."
+
+            if str(app).lower() in {"edge", "msedge", "microsoft edge"}:
+                app_display = "Microsoft Edge"
+            elif browser:
+                app_display = browser
+            else:
+                app_display = str(app) if any(c.isupper() for c in str(app)) else str(app).capitalize()
+
+            if lang == "hinglish":
+                return f"{app_display} khol diya hai."
+            return f"Opened {app_display}."
 
         # 2. Application Close
         if tool_name == "close_app":
@@ -801,6 +994,20 @@ class IntentEngine:
             if not drives:
                 msg = res_data.get("message", "Unable to read disk drives.")
                 return f"Disk space information could not be retrieved: {msg}" if lang == "english" else f"Disk space ki jankari nahi mil saki: {msg}"
+
+            almost_full = res_data.get("almost_full_drives", [])
+            if params.get("almost_full_only"):
+                if almost_full:
+                    af = almost_full[0]
+                    if lang == "hinglish":
+                        return f"Aapka {af['drive']} drive lagbhag full ho chuka hai: {af['used_percent']}% used hai aur kewal {af['free_gb']} GB space khali bachi hai {af['total_gb']} GB total mein se."
+                    return f"Your {af['drive']} drive is almost full with {af['used_percent']}% used and only {af['free_gb']} GB available out of {af['total_gb']} GB total."
+                else:
+                    most_used = res_data.get("most_used_drive", "C:")
+                    most_pct = res_data.get("most_used_percent", 0)
+                    if lang == "hinglish":
+                        return f"Aapka koi bhi drive lagbhag full nahi hai. Sabse zyada use hone wala drive {most_used} hai ({most_pct}% used)."
+                    return f"None of your drives are currently almost full. Drive with highest usage is {most_used} with {most_pct}% used."
 
             parts_en = []
             parts_hi = []
@@ -944,6 +1151,81 @@ class IntentEngine:
             if lang == "hinglish":
                 return "Desktop screenshot capture kar liya hai."
             return "Desktop screenshot captured."
+
+        # 9. Browser Launching
+        if tool_name == "launch_browser":
+            res_obj = result.get("result", {})
+            b_name = res_obj.get("browser") or params.get("browser_name", "Browser")
+            url_target = params.get("url") or res_obj.get("target")
+            if status == "success" or res_obj.get("status") == "success":
+                if url_target and "youtube" in str(url_target).lower():
+                    if lang == "hinglish":
+                        return f"{b_name} mein YouTube khol diya hai."
+                    return f"Opened YouTube in {b_name}."
+                if lang == "hinglish":
+                    return f"{b_name} khol diya hai."
+                return f"Opened {b_name}."
+            else:
+                msg = res_obj.get("message") or result.get("message")
+                return msg or (f"{b_name} launch nahi ho saka." if lang == "hinglish" else f"Failed to launch {b_name}.")
+
+        # 10. Duplicate Files Discovery
+        if tool_name == "find_duplicate_files":
+            res_data = result.get("result", {})
+            groups = res_data.get("duplicate_groups", [])
+            rec_mb = res_data.get("total_recoverable_mb", 0)
+            if not groups:
+                return "No duplicate files detected in your user directories." if lang == "english" else "Aapke user folders mein koi duplicate files nahi mili."
+            first_g = groups[0]
+            first_name = first_g["files"][0]["filename"] if first_g.get("files") else "file"
+            if lang == "hinglish":
+                return f"{len(groups)} duplicate file groups mile hain jisse lagbhag {rec_mb} MB space bacha sakte hain. Pehla duplicate: '{first_name}'."
+            return f"Found {len(groups)} duplicate file groups with up to {rec_mb} MB of recoverable space. Example duplicate: '{first_name}' ({first_g['size_mb']} MB)."
+
+        # 11. Multi-Step Diagnostic
+        if tool_name == "plan_system_diagnosis":
+            res_data = result.get("result", {})
+            narrative = res_data.get("narrative")
+            if narrative:
+                return narrative
+            return "System diagnosis complete. Telemetry collected."
+
+        # 12. Storage Analysis
+        if tool_name == "analyze_storage_cleanup":
+            res_data = result.get("result", {})
+            safe_mb = res_data.get("safe_recovery_mb", 0)
+            rev_mb = res_data.get("review_recovery_mb", 0)
+            tot_mb = res_data.get("total_recoverable_mb", 0)
+            tot_gb = round(tot_mb / 1024, 2)
+            if lang == "hinglish":
+                return f"Storage analysis poora hua: {safe_mb} MB safe temporary cache aur {rev_mb} MB review karne yogya files mili hain (kul {tot_mb} MB space recover ho sakti hai)."
+            return f"Storage analysis complete. You can recover up to {tot_gb} GB ({safe_mb} MB safe temporary files + {rev_mb} MB items ready for review)."
+
+        # 13. Project Folder Analysis
+        if tool_name == "analyze_project_folder":
+            res_data = result.get("result", {})
+            pname = res_data.get("project_name", "Project")
+            stack = ", ".join(res_data.get("tech_stack", []))
+            cnt = res_data.get("total_files", 0)
+            sz = res_data.get("total_size_mb", 0)
+            if lang == "hinglish":
+                return f"'{pname}' project ({stack}): kul {cnt} files hain, total size {sz} MB."
+            return f"Project '{pname}' ({stack}): contains {cnt} files, {sz} MB total size."
+
+        # 14. File Recycling (Reversible Deletion)
+        if tool_name == "recycle_file_safely":
+            res_data = result.get("result") if isinstance(result.get("result"), dict) else result
+            f_path = res_data.get("path") or params.get("file_path", "")
+            if status == "success" or res_data.get("status") == "success":
+                dest = res_data.get("destination", "Recycle Bin")
+                if lang == "hinglish":
+                    return f"File '{os.path.basename(f_path)}' ko safely {dest} mein bhej diya hai."
+                return f"Moved '{os.path.basename(f_path)}' safely to {dest}."
+            else:
+                msg = res_data.get("message", "Unable to recycle file.")
+                if lang == "hinglish":
+                    return f"File recycle nahi ho saki: {msg}"
+                return f"Failed to recycle file: {msg}"
 
         # Fallback
         return "Task completed successfully." if lang == "english" else "Operation poora ho gaya hai."

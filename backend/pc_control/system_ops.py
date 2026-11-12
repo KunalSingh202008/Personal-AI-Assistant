@@ -234,6 +234,8 @@ def get_disk_space(target_drive: Optional[str] = None) -> Dict[str, Any]:
             return {"status": "error", "message": f"Unable to read drive storage: {str(e)}", "drives": []}
 
     most_free = max(drives, key=lambda d: d["free_gb"])
+    most_used = max(drives, key=lambda d: d["used_percent"])
+    almost_full_drives = [d for d in drives if d["used_percent"] >= 85.0 or d["free_gb"] < 15.0]
     total_cap = sum(d["total_gb"] for d in drives)
     total_free = sum(d["free_gb"] for d in drives)
     total_used = sum(d["used_gb"] for d in drives)
@@ -243,6 +245,9 @@ def get_disk_space(target_drive: Optional[str] = None) -> Dict[str, Any]:
         "drives": drives,
         "most_free_drive": most_free["drive"],
         "most_free_gb": most_free["free_gb"],
+        "most_used_drive": most_used["drive"],
+        "most_used_percent": most_used["used_percent"],
+        "almost_full_drives": almost_full_drives,
         "summary": {
             "total_capacity_gb": round(total_cap, 1),
             "total_free_gb": round(total_free, 1),

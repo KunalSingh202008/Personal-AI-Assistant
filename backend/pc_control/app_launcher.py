@@ -100,17 +100,51 @@ def find_edge_executable() -> Optional[str]:
             return c
     return shutil.which("msedge.exe")
 
-def resolve_default_browser() -> str:
-    """Return the primary installed browser on Windows."""
-    chrome = find_chrome_executable()
-    if chrome:
-        return chrome
+def find_firefox_executable() -> Optional[str]:
+    """Dynamically resolve Mozilla Firefox path via registry and standard file locations."""
+    for root in [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]:
+        try:
+            with winreg.OpenKey(root, r"Software\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe") as key:
+                val, _ = winreg.QueryValueEx(key, "")
+                if val and os.path.exists(val):
+                    return val
+        except OSError:
+            pass
+    candidates = [
+        os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), r"Mozilla Firefox\firefox.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), r"Mozilla Firefox\firefox.exe"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return shutil.which("firefox.exe")
+
+def find_installed_browsers() -> Dict[str, str]:
+    """
+    Dynamically discover all installed web browsers on this Windows host.
+    Returns mapping of friendly browser names to their executable paths.
+    """
+    browsers = {}
     brave = find_brave_executable()
     if brave:
-        return brave
+        browsers["Brave"] = brave
     edge = find_edge_executable()
     if edge:
-        return edge
+        browsers["Microsoft Edge"] = edge
+    chrome = find_chrome_executable()
+    if chrome:
+        browsers["Google Chrome"] = chrome
+    firefox = find_firefox_executable()
+    if firefox:
+        browsers["Mozilla Firefox"] = firefox
+    return browsers
+
+def resolve_default_browser() -> str:
+    """Return the primary installed browser on Windows."""
+    installed = find_installed_browsers()
+    for pref in ["Google Chrome", "Brave", "Microsoft Edge", "Mozilla Firefox"]:
+        if pref in installed:
+            return installed[pref]
     return "msedge.exe"
 
 # Mapping of application keywords to their exact binary executables
@@ -220,29 +254,260 @@ def is_process_running(proc_name: str) -> bool:
     candidates = APP_PROCESS_MAP.get(normalized, [proc_name])
     return len(get_running_process_pids(candidates)) > 0
 
+def launch_browser(browser_name: Optional[str] = None, url: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Launch a browser or URL with strict browser resolution and verification.
+    - If browser_name is specified (e.g. 'brave', 'edge', 'chrome', 'firefox'):
+      Resolves and launches that exact browser. If not installed, returns an actionable
+      error explaining that the requested browser is absent and lists available browsers.
+      NEVER silently substitutes another browser!
+    - If browser_name is None:
+      Uses the default installed browser.
+    - If url is provided:
+      Opens the specified URL in the target browser.
+    - Verifies actual execution on Windows.
+    """
+    installed = find_installed_browsers()
+    available_names = list(installed.keys())
+    avail_str = f" Available browsers: {', '.join(available_names)}." if available_names else ""
+
+    target_exe: Optional[str] = None
+    target_display: str = "Browser"
+    candidates: List[str] = ["msedge.exe", "brave.exe", "chrome.exe", "firefox.exe"]
+
+    if browser_name:
+        b_clean = browser_name.strip().lower()
+        if "brave" in b_clean:
+            target_display = "Brave"
+            target_exe = installed.get("Brave")
+            candidates = ["brave.exe"]
+        elif "edge" in b_clean:
+            target_display = "Microsoft Edge"
+            target_exe = installed.get("Microsoft Edge")
+            candidates = ["msedge.exe"]
+        elif "chrome" in b_clean:
+            target_display = "Google Chrome"
+            target_exe = installed.get("Google Chrome")
+            candidates = ["chrome.exe"]
+        elif "firefox" in b_clean:
+            target_display = "Mozilla Firefox"
+            target_exe = installed.get("Mozilla Firefox")
+            candidates = ["firefox.exe"]
+        else:
+            for name, exe in installed.items():
+                if b_clean in name.lower():
+                    target_display = name
+                    target_exe = exe
+                    candidates = [os.path.basename(exe)]
+                    break
+
+        if not target_exe:
+            if url and "youtube" in url.lower():
+                msg = f"Google Chrome is not installed on this system to open YouTube.{avail_str}" if "chrome" in b_clean else f"{target_display} is not installed on this system.{avail_str}"
+            else:
+                msg = f"{target_display} is not installed on this computer.{avail_str}"
+            return {
+                "status": "error",
+                "message": msg,
+                "verified": False,
+                "missing_browser": browser_name,
+                "missing_app": browser_name.lower(),
+                "available_browsers": available_names,
+            }
+    else:
+        # Default available browser
+        if "Brave" in installed:
+            target_exe = installed["Brave"]
+            target_display = "Brave"
+            candidates = ["brave.exe"]
+        elif "Microsoft Edge" in installed:
+            target_exe = installed["Microsoft Edge"]
+            target_display = "Microsoft Edge"
+            candidates = ["msedge.exe"]
+        elif "Google Chrome" in installed:
+            target_exe = installed["Google Chrome"]
+            target_display = "Google Chrome"
+            candidates = ["chrome.exe"]
+        else:
+            target_exe = resolve_default_browser()
+
+    before_pids = get_running_process_pids(candidates)
+
+    try:
+        if url:
+            if target_exe:
+                subprocess.Popen([target_exe, url], shell=False)
+            else:
+                webbrowser.open(url)
+            msg = f"Opened YouTube in {target_display}." if "youtube" in url.lower() else f"Opened {url} in {target_display}."
+        else:
+            if target_exe:
+                subprocess.Popen([target_exe], shell=False)
+            else:
+                os.startfile(resolve_default_browser())
+            msg = f"Opened {target_display}."
+
+        # Quick verification of launch (<20ms per poll)
+        start_t = time.time()
+        new_pids: Set[int] = set()
+        while time.time() - start_t < 1.0:
+            curr = get_running_process_pids(candidates)
+            new_pids = curr - before_pids
+            if new_pids:
+                break
+            time.sleep(0.05)
+
+        curr = get_running_process_pids(candidates)
+        verified = bool(new_pids or curr)
+
+        return {
+            "status": "success",
+            "message": msg,
+            "verified": verified,
+            "browser": target_display,
+            "target": url or target_exe,
+            "pids": list(new_pids) if new_pids else list(curr),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to launch {target_display}: {str(e)}",
+            "verified": False,
+        }
+
+def get_installed_applications(limit: int = 50, filter_term: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Retrieve real installed applications from Windows Registry with versions and publishers.
+    Supports filtering by application name.
+    """
+    apps = []
+    keys = [
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    seen = set()
+    filter_lower = filter_term.lower().strip() if filter_term else None
+
+    for root, subkey in keys:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                num_subkeys, _, _ = winreg.QueryInfoKey(key)
+                for i in range(num_subkeys):
+                    try:
+                        subname = winreg.EnumKey(key, i)
+                        with winreg.OpenKey(key, subname) as app_key:
+                            try:
+                                display_name, _ = winreg.QueryValueEx(app_key, "DisplayName")
+                                if not display_name or not display_name.strip():
+                                    continue
+                                name_clean = display_name.strip()
+                                if name_clean in seen:
+                                    continue
+                                if filter_lower and filter_lower not in name_clean.lower():
+                                    continue
+
+                                seen.add(name_clean)
+                                version = ""
+                                try:
+                                    version, _ = winreg.QueryValueEx(app_key, "DisplayVersion")
+                                except OSError:
+                                    pass
+                                publisher = ""
+                                try:
+                                    publisher, _ = winreg.QueryValueEx(app_key, "Publisher")
+                                except OSError:
+                                    pass
+                                install_loc = ""
+                                try:
+                                    install_loc, _ = winreg.QueryValueEx(app_key, "InstallLocation")
+                                except OSError:
+                                    pass
+
+                                apps.append({
+                                    "name": name_clean,
+                                    "version": str(version),
+                                    "publisher": str(publisher),
+                                    "install_location": str(install_loc) if install_loc else None,
+                                })
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    apps.sort(key=lambda x: x["name"].lower())
+    return {
+        "status": "success",
+        "total_count": len(apps),
+        "applications": apps[:limit],
+        "limit": limit,
+        "filter": filter_term,
+    }
+
+def get_startup_applications() -> Dict[str, Any]:
+    """
+    Retrieve applications configured to start automatically on Windows boot/login.
+    Inspects Registry Run keys and Startup folder.
+    """
+    items = []
+    run_keys = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Current User Run"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "System Run"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run", "System Run 32-bit"),
+    ]
+    seen = set()
+    for root, subkey, desc in run_keys:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                num_values = winreg.QueryInfoKey(key)[1]
+                for i in range(num_values):
+                    try:
+                        name, val, _ = winreg.EnumValue(key, i)
+                        if name and name not in seen:
+                            seen.add(name)
+                            val_lower = str(val).lower()
+                            impact = "Medium"
+                            if any(h in val_lower for h in ["epic", "steam", "discord", "spotify", "teams"]):
+                                impact = "High"
+                            elif any(l in val_lower for l in ["security", "rtk", "audio", "driver"]):
+                                impact = "Low"
+                            items.append({
+                                "name": name,
+                                "command": str(val),
+                                "location": desc,
+                                "impact": impact,
+                            })
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    # Check Startup folder
+    startup_dir = os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")
+    if os.path.exists(startup_dir):
+        for f in os.listdir(startup_dir):
+            if not f.startswith(".") and f not in seen:
+                seen.add(f)
+                items.append({
+                    "name": f,
+                    "command": os.path.join(startup_dir, f),
+                    "location": "Startup Folder",
+                    "impact": "Medium",
+                })
+
+    return {
+        "status": "success",
+        "count": len(items),
+        "startup_applications": items,
+    }
+
 def open_youtube(target_browser: Optional[str] = None) -> Dict[str, Any]:
     """Safely open https://www.youtube.com using an approved browser-launch mechanism."""
     url = "https://www.youtube.com"
-    if target_browser and "chrome" in target_browser.lower():
-        chrome_exe = find_chrome_executable()
-        if not chrome_exe:
-            avail = []
-            if find_brave_executable():
-                avail.append("Brave")
-            if find_edge_executable():
-                avail.append("Microsoft Edge")
-            avail_str = f" Available browsers: {', '.join(avail)}." if avail else ""
-            return {
-                "status": "error",
-                "message": f"Google Chrome is not installed on this system to open YouTube.{avail_str}",
-                "verified": False,
-                "missing_app": "chrome"
-            }
-        try:
-            subprocess.Popen([chrome_exe, url], shell=False)
-            return {"status": "success", "message": "Opened YouTube in Google Chrome.", "verified": True, "target": url}
-        except Exception as e:
-            return {"status": "error", "message": f"Failed to launch Chrome for YouTube: {str(e)}", "verified": False}
+    if target_browser:
+        return launch_browser(browser_name=target_browser, url=url)
 
     # Open via default system browser mechanism
     try:
@@ -253,7 +518,7 @@ def open_youtube(target_browser: Optional[str] = None) -> Dict[str, Any]:
                 subprocess.Popen([b_path, url], shell=False)
             else:
                 os.startfile(url)
-        return {"status": "success", "message": "Opened YouTube.", "verified": True, "target": url}
+        return {"status": "success", "message": "Opened YouTube in your browser.", "verified": True, "target": url}
     except Exception as e:
         return {"status": "error", "message": f"Failed to open YouTube: {str(e)}", "verified": False}
 
@@ -269,40 +534,24 @@ def launch_application(app_name: str, timeout_sec: float = 1.0) -> Dict[str, Any
         return open_youtube()
     if normalized in {"youtube in chrome", "open youtube in chrome"}:
         return open_youtube(target_browser="chrome")
+    if normalized in {"youtube in brave", "open youtube in brave"}:
+        return open_youtube(target_browser="brave")
+    if normalized in {"youtube in edge", "open youtube in edge"}:
+        return open_youtube(target_browser="edge")
+    if normalized in {"youtube in firefox", "open youtube in firefox"}:
+        return open_youtube(target_browser="firefox")
 
-    # Special handling for Chrome
-    if normalized in {"chrome", "google chrome"}:
-        chrome_exe = find_chrome_executable()
-        if not chrome_exe:
-            avail = []
-            if find_brave_executable():
-                avail.append("Brave")
-            if find_edge_executable():
-                avail.append("Microsoft Edge")
-            avail_str = f" Available browsers: {', '.join(avail)}." if avail else ""
-            return {
-                "status": "error",
-                "message": f"Google Chrome is not installed on this computer.{avail_str}",
-                "verified": False,
-                "missing_app": "chrome"
-            }
-        target_cmd = chrome_exe
-        candidates = ["chrome.exe"]
-    elif normalized in {"brave", "brave browser"}:
-        brave_exe = find_brave_executable()
-        if not brave_exe:
-            return {"status": "error", "message": "Brave Browser is not installed on this computer.", "verified": False}
-        target_cmd = brave_exe
-        candidates = ["brave.exe"]
-    elif normalized in {"edge", "microsoft edge"}:
-        edge_exe = find_edge_executable()
-        if not edge_exe:
-            return {"status": "error", "message": "Microsoft Edge is not installed on this computer.", "verified": False}
-        target_cmd = edge_exe
-        candidates = ["msedge.exe"]
+    # Special handling for Browsers
+    if normalized in {"brave", "brave browser", "open brave"}:
+        return launch_browser("brave")
+    if normalized in {"edge", "microsoft edge", "open edge"}:
+        return launch_browser("edge")
+    if normalized in {"chrome", "google chrome", "open chrome"}:
+        return launch_browser("chrome")
+    if normalized in {"firefox", "mozilla firefox", "open firefox"}:
+        return launch_browser("firefox")
     elif normalized in {"browser"}:
-        target_cmd = resolve_default_browser()
-        candidates = ["chrome.exe", "brave.exe", "msedge.exe"]
+        return launch_browser()
     else:
         target_cmd = KNOWN_APPS.get(normalized, normalized)
         candidates = APP_PROCESS_MAP.get(normalized, [target_cmd])

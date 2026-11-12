@@ -237,6 +237,135 @@ PC_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
             "required": ["folder_path"]
         }
+    },
+    {
+        "name": "launch_browser",
+        "description": "Launch a specific detected browser (Edge, Brave, Chrome, Firefox) or open a URL in a browser.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "browser_name": {
+                    "type": "string",
+                    "description": "Optional name of browser ('brave', 'edge', 'chrome', 'firefox')."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Optional website URL to open."
+                }
+            }
+        }
+    },
+    {
+        "name": "get_installed_applications",
+        "description": "List genuine applications installed on this Windows PC via registry.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of applications to return (default: 50).",
+                    "default": 50
+                },
+                "filter_term": {
+                    "type": "string",
+                    "description": "Optional filter substring for application name."
+                }
+            }
+        }
+    },
+    {
+        "name": "get_startup_applications",
+        "description": "List programs configured to launch on Windows startup.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "find_duplicate_files",
+        "description": "Scan user storage folders for duplicate files using safe progressive hashing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directory": {
+                    "type": "string",
+                    "description": "Optional directory to scan (defaults to user Downloads, Documents, Desktop)."
+                },
+                "min_size_kb": {
+                    "type": "integer",
+                    "description": "Minimum file size in KB to consider (default: 50).",
+                    "default": 50
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum duplicate groups to report (default: 15).",
+                    "default": 15
+                }
+            }
+        }
+    },
+    {
+        "name": "identify_temporary_files",
+        "description": "Identify temporary files and caches in %TEMP% and user directories.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of items to return (default: 30).",
+                    "default": 30
+                }
+            }
+        }
+    },
+    {
+        "name": "analyze_storage_cleanup",
+        "description": "Comprehensive storage analysis categorizing safe cleanup candidates vs review-recommended items.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_drive": {
+                    "type": "string",
+                    "description": "Optional target drive or path."
+                }
+            }
+        }
+    },
+    {
+        "name": "analyze_project_folder",
+        "description": "Deeply inspect a software project folder: tech stack, git status, file count, size, and health.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_path_or_name": {
+                    "type": "string",
+                    "description": "Name or full filesystem path of the project."
+                }
+            },
+            "required": ["project_path_or_name"]
+        }
+    },
+    {
+        "name": "plan_system_diagnosis",
+        "description": "Multi-step diagnostic audit analyzing CPU, RAM, disk bottlenecks, heavy processes, and startup apps.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "recycle_file_safely",
+        "description": "Move a file to Windows Recycle Bin. Destructive action requiring user approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Full path of file to recycle."
+                }
+            },
+            "required": ["file_path"]
+        }
     }
 ]
 
@@ -246,12 +375,16 @@ SAFE_VOICE_ACTIONS = {
     # Native Apps & Tools
     "launch_camera", "launch_youtube", "launch_chrome", "launch_vscode",
     "launch_calculator", "launch_notepad", "launch_app", "close_app",
+    "launch_browser", "get_installed_applications", "get_startup_applications",
     # File & Status
     "find_resume", "find_resume_files", "open_latest_pdf", "open_downloads",
     "screenshot", "capture_desktop_screenshot", "battery_status", "system_status",
     "get_system_metrics", "get_disk_space", "list_running_processes", "find_large_files",
     "open_folder", "time", "date",
     "web_search", "web_search_summary", "search_user_files", "open_file_path",
+    # Storage & Intelligence
+    "find_duplicate_files", "identify_temporary_files", "analyze_storage_cleanup",
+    "analyze_project_folder", "plan_system_diagnosis",
     # Conversational / Assistant State
     "stop_listening", "pause_listening", "assistant_identity",
     "help", "identity", "projects_info", "greeting", "conversational_ai"
@@ -300,6 +433,8 @@ class ToolRegistry:
         - RED: Destructive / unauthorized operations (strictly blocked)
         """
         if action_name in BLOCKED_ACTIONS:
+            return "RED"
+        if action_name in {"recycle_file_safely", "delete_file", "destroy_file"}:
             return "RED"
         if action_name in RISKY_APPROVAL_ACTIONS:
             return "AMBER"
@@ -451,6 +586,57 @@ class ToolRegistry:
                     "message": f"Running project '{project_name}' requires execution approval.",
                     "tool": tool_name,
                 }
+
+            # 8. Browser Management
+            elif tool_name == "launch_browser":
+                b_name = arguments.get("browser_name")
+                target_url = arguments.get("url")
+                res = pc_control.launch_browser(b_name, target_url)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 9. Application & Startup Diagnostics
+            elif tool_name == "get_installed_applications":
+                lim = int(arguments.get("limit", 50))
+                filt = arguments.get("filter_term")
+                res = pc_control.get_installed_applications(limit=lim, filter_term=filt)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "get_startup_applications":
+                res = pc_control.get_startup_applications()
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            # 10. Storage & Duplicate Intelligence
+            elif tool_name == "find_duplicate_files":
+                scan_d = arguments.get("directory")
+                min_kb = int(arguments.get("min_size_kb", 50))
+                max_r = int(arguments.get("max_results", 15))
+                res = pc_control.find_duplicate_files(directory=scan_d, min_size_kb=min_kb, max_results=max_r)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "identify_temporary_files":
+                max_r = int(arguments.get("max_results", 30))
+                res = pc_control.identify_temporary_files(max_results=max_r)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "analyze_storage_cleanup":
+                td = arguments.get("target_drive")
+                res = pc_control.analyze_storage_cleanup(target_drive_or_path=td)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "analyze_project_folder":
+                p_arg = arguments.get("project_path_or_name", "").strip()
+                res = pc_control.analyze_project_folder(p_arg)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            elif tool_name == "plan_system_diagnosis":
+                from pc_control.task_planner import task_planner
+                res = task_planner.plan_system_diagnosis()
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "recycle_file_safely":
+                fpath = arguments.get("file_path", "").strip()
+                res = pc_control.recycle_file_safely(fpath)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
 
             else:
                 return {
