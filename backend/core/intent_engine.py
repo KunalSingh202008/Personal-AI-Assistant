@@ -359,6 +359,91 @@ class IntentEngine:
                 fast_path=True,
             )
 
+        # Disk Space & Storage Utilization
+        if re.search(r'\b(free space|disk space|storage space|hard drive|free storage|space available|kitna space|space kitna|kitna storage|storage kitna|free disk|how much storage|storage left|storage remaining|storage available)\b', lower) or (
+            re.search(r'\b(drive)\b', lower) and re.search(r'\b(free|space|capacity|most|storage)\b', lower)
+        ) or (
+            re.search(r'\b(storage|disk)\b', lower) and re.search(r'\b(how much|how many|kitna|left|remaining|available)\b', lower)
+        ):
+            target_drive = None
+            d_match = re.search(r'\b([c-zC-Z])\s*(?:drive|:)\b', query)
+            if d_match:
+                target_drive = f"{d_match.group(1).upper()}:"
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="get_disk_space",
+                parameters={"drive": target_drive} if target_drive else {},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Running Processes & Top Memory Consumers
+        if re.search(r'\b(processes|process list|running processes|apps consuming|consuming the most memory|consuming most memory|highest memory|top memory|kaun se processes|task manager list)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="list_running_processes",
+                parameters={"limit": 10, "sort_by_memory": True},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Find Large Files
+        if re.search(r'\b(large files|heavy files|badi files|biggest files|largest files|files taking space)\b', lower):
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="find_large_files",
+                parameters={"min_size_mb": 100, "max_results": 10},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # Open Folder
+        folder_open_match = re.search(r'\b(?:open|kholo)\s+(?:the\s+|my\s+)?([a-zA-Z0-9_\- ]+?)\s+folder\b', lower) or (
+            re.search(r'\b(?:open|kholo)\s+(downloads|documents|desktop|videos|music|pictures)\b', lower)
+        )
+        if folder_open_match:
+            folder_name = folder_open_match.group(1).strip()
+            if folder_name in {"this", "the", "that"}:
+                ctx = entity_tracker.get_context(conversation_id)
+                if ctx.get("last_project"):
+                    folder_name = ctx["last_project"].get("path") or ctx["last_project"].get("name")
+                elif ctx.get("last_file"):
+                    folder_name = ctx["last_file"].get("path", "")
+            if folder_name:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="open_folder",
+                    parameters={"folder_path": folder_name},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # Previous Question / Reflection
+        if re.search(r'\b(what did i ask|what was my last question|previous question|pichla sawal|pehle kya pucha)\b', lower):
+            from core.conversation_manager import conversation_manager
+            db_msgs = conversation_manager.get_messages(conversation_id) if conversation_id else []
+            user_msgs = [m for m in db_msgs if m.get("role") == "user"]
+            candidates = [
+                m for m in user_msgs
+                if not re.search(r'\b(what did i ask|last question|previous question|pichla sawal|pehle kya pucha)\b', m.get("content", "").lower())
+            ]
+            if candidates:
+                last_q = candidates[-1]["content"]
+                resp = f"Aapne pehle pucha tha: '{last_q}'" if lang == "hinglish" else f"You previously asked: '{last_q}'"
+            else:
+                resp = "Aapka koi pichla sawal nahi mila." if lang == "hinglish" else "I could not find any previous questions in this session."
+            return IntentResult(
+                intent_type="QUESTION",
+                tool_name="reflection",
+                response_text=resp,
+                language=lang,
+                fast_path=True,
+            )
+
         # Time & Date
         if re.search(r'\b(what time is it|current time|kya samay hua|time batao|kitne baje hain)\b', lower):
             import datetime
@@ -634,6 +719,83 @@ class IntentEngine:
             if lang == "hinglish":
                 return f"Aapke laptop ka RAM usage {ram_pct}% hai ({used_gb:.1f} GB of {total_gb:.1f} GB used)."
             return f"Your laptop's RAM usage is currently {ram_pct}% ({used_gb:.1f} GB of {total_gb:.1f} GB used)."
+
+        # 3b. Disk Space & Storage Utilization
+        if tool_name == "get_disk_space":
+            res_data = result.get("result", {})
+            drives = res_data.get("drives", [])
+            if not drives:
+                msg = res_data.get("message", "Unable to read disk drives.")
+                return f"Disk space information could not be retrieved: {msg}" if lang == "english" else f"Disk space ki jankari nahi mil saki: {msg}"
+
+            parts_en = []
+            parts_hi = []
+            for d in drives:
+                d_name = d.get("drive", "")
+                free_gb = d.get("free_gb", 0)
+                tot_gb = d.get("total_gb", 0)
+                used_pct = d.get("used_percent", 0)
+                parts_en.append(f"{d_name} has {free_gb} GB free out of {tot_gb} GB ({used_pct}% used)")
+                parts_hi.append(f"{d_name} mein {free_gb} GB free hai {tot_gb} GB mein se ({used_pct}% used)")
+
+            summary_str_en = ". ".join(parts_en) + "."
+            summary_str_hi = ". ".join(parts_hi) + "."
+
+            if len(drives) > 1:
+                most_free = res_data.get("most_free_drive")
+                most_gb = res_data.get("most_free_gb")
+                if most_free and most_gb:
+                    summary_str_en += f" Drive with the most free space is {most_free} with {most_gb} GB available."
+                    summary_str_hi += f" Sabse zyada free space {most_free} drive mein hai ({most_gb} GB available)."
+
+            return summary_str_hi if lang == "hinglish" else summary_str_en
+
+        # 3c. Running Processes & Memory
+        if tool_name == "list_running_processes":
+            res_data = result.get("result", {})
+            procs = res_data.get("processes", [])
+            if not procs:
+                return "No running processes found." if lang == "english" else "Koi running process nahi mila."
+
+            top_3 = procs[:3]
+            proc_desc_en = ", ".join([f"{p.get('ProcessName')} ({p.get('MemoryMB')} MB)" for p in top_3])
+            proc_desc_hi = ", ".join([f"{p.get('ProcessName')} ({p.get('MemoryMB')} MB)" for p in top_3])
+
+            if lang == "hinglish":
+                return f"Sabse zyada memory lene wale top processes hain: {proc_desc_hi}. Total {res_data.get('total_unique_processes', len(procs))} unique processes active hain."
+            return f"Top memory-consuming processes are: {proc_desc_en}. There are {res_data.get('total_unique_processes', len(procs))} unique processes currently active."
+
+        # 3d. Large Files Search
+        if tool_name == "find_large_files":
+            res_data = result.get("result", {})
+            files = res_data.get("files", [])
+            min_mb = res_data.get("min_size_mb", 100)
+            if not files:
+                if lang == "hinglish":
+                    return f"Aapke user folders mein {min_mb} MB se badi koi file nahi mili."
+                return f"No files larger than {min_mb} MB were found in your user directories."
+
+            top_files = files[:3]
+            f_parts_en = [f"'{f.get('name')}' ({f.get('size_mb')} MB in {f.get('folder')})" for f in top_files]
+            f_parts_hi = [f"'{f.get('name')}' ({f.get('size_mb')} MB, {f.get('folder')})" for f in top_files]
+
+            if lang == "hinglish":
+                return f"Maine {len(files)} badi files dhundi hain: {', '.join(f_parts_hi)}."
+            return f"Found {len(files)} large files taking the most space: {', '.join(f_parts_en)}."
+
+        # 3e. Open Folder
+        if tool_name == "open_folder":
+            res_data = result.get("result", {})
+            f_path = res_data.get("path") or params.get("folder_path", "")
+            if status == "success" or res_data.get("status") == "success":
+                if lang == "hinglish":
+                    return f"Folder khol diya hai: {f_path}"
+                return f"Opened folder: {f_path}"
+            else:
+                msg = res_data.get("message", "Unable to open folder.")
+                if lang == "hinglish":
+                    return f"Folder nahi khul saka: {msg}"
+                return f"Failed to open folder: {msg}"
 
         # 4. Resume Search
         if tool_name in {"find_resume_files", "find_resume"}:

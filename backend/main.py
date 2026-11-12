@@ -71,7 +71,10 @@ from pc_control import (
     set_volume,
     toggle_mute,
     get_system_metrics,
+    get_disk_space,
     list_running_processes,
+    find_large_files,
+    open_folder,
     capture_desktop_screenshot,
     search_user_files,
 )
@@ -1592,6 +1595,11 @@ async def pc_system_endpoint():
 async def pc_processes_endpoint(limit: int = 20):
     """List top running processes by memory."""
     return list_running_processes(limit)
+
+@app.get("/api/pc/storage", dependencies=[Security(require_local_auth)])
+async def pc_storage_endpoint(drive: Optional[str] = None):
+    """Get storage and free space metrics across mounted Windows drives."""
+    return get_disk_space(drive)
 
 @app.post("/api/pc/screenshot", dependencies=[Security(require_local_auth)])
 async def pc_screenshot_endpoint():

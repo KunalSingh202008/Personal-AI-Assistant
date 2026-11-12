@@ -172,6 +172,71 @@ PC_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
             "required": ["project_name"]
         }
+    },
+    {
+        "name": "get_disk_space",
+        "description": "Retrieve genuine storage metrics, total capacity, and free space across all active Windows drives.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "drive": {
+                    "type": "string",
+                    "description": "Optional specific drive letter (e.g. 'C:' or 'D:')."
+                }
+            }
+        }
+    },
+    {
+        "name": "list_running_processes",
+        "description": "Query genuine active Windows processes and top memory-consuming applications.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of processes to return (default: 15).",
+                    "default": 15
+                },
+                "sort_by_memory": {
+                    "type": "boolean",
+                    "description": "Whether to sort by memory consumption descending.",
+                    "default": True
+                }
+            }
+        }
+    },
+    {
+        "name": "find_large_files",
+        "description": "Find large files exceeding a size threshold in user directories (Downloads, Documents, Desktop).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "min_size_mb": {
+                    "type": "integer",
+                    "description": "Minimum size in megabytes (default: 100).",
+                    "default": 100
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of files to return (default: 10).",
+                    "default": 10
+                }
+            }
+        }
+    },
+    {
+        "name": "open_folder",
+        "description": "Open a specified folder in Windows File Explorer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "folder_path": {
+                    "type": "string",
+                    "description": "Path or alias of folder to open (e.g., 'Downloads', 'Documents', 'Desktop', or full path)."
+                }
+            },
+            "required": ["folder_path"]
+        }
     }
 ]
 
@@ -184,7 +249,8 @@ SAFE_VOICE_ACTIONS = {
     # File & Status
     "find_resume", "find_resume_files", "open_latest_pdf", "open_downloads",
     "screenshot", "capture_desktop_screenshot", "battery_status", "system_status",
-    "get_system_metrics", "time", "date",
+    "get_system_metrics", "get_disk_space", "list_running_processes", "find_large_files",
+    "open_folder", "time", "date",
     "web_search", "web_search_summary", "search_user_files", "open_file_path",
     # Conversational / Assistant State
     "stop_listening", "pause_listening", "assistant_identity",
@@ -309,6 +375,28 @@ class ToolRegistry:
             elif tool_name in {"get_system_metrics", "system_status", "battery_status"}:
                 res = pc_control.get_system_metrics()
                 return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "get_disk_space":
+                drive_arg = arguments.get("drive")
+                res = pc_control.get_disk_space(target_drive=drive_arg)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "list_running_processes":
+                lim = int(arguments.get("limit", 15))
+                sort_mem = bool(arguments.get("sort_by_memory", True))
+                res = pc_control.list_running_processes(limit=lim, sort_by_memory=sort_mem)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "find_large_files":
+                min_mb = int(arguments.get("min_size_mb", 100))
+                max_res = int(arguments.get("max_results", 10))
+                res = pc_control.find_large_files(min_size_mb=min_mb, max_results=max_res)
+                return {"status": "success", "result": res, "tool": tool_name}
+
+            elif tool_name == "open_folder":
+                folder_arg = arguments.get("folder_path") or arguments.get("path") or arguments.get("folder", "")
+                res = pc_control.open_folder(folder_arg)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
 
             # 4. Desktop Screenshot
             elif tool_name in {"capture_desktop_screenshot", "screenshot"}:

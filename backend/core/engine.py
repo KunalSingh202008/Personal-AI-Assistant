@@ -96,7 +96,9 @@ class KelaEngine:
             # Structured intent classification for text interface
             intent = intent_engine.classify_intent(last_user_message, conversation_id=conversation_id)
 
-            if intent.intent_type in {"SESSION_CONTROL"}:
+            if intent.intent_type in {"SESSION_CONTROL"} or (
+                intent.intent_type == "QUESTION" and intent.tool_name == "reflection" and intent.response_text
+            ):
                 resp = intent.response_text
                 yield ndjson({"token": resp})
                 self.conversations.save_assistant_message(

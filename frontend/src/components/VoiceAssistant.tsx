@@ -467,9 +467,13 @@ export default function VoiceAssistant({
       const turnId = `voice_${Date.now()}`;
 
       try {
+        const authHeaders = await getAuthHeaders(apiUrl);
         const response = await fetch(`${apiUrl}/api/voice/conversation`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...authHeaders,
+          },
           body: JSON.stringify({
             text: cleanText,
             conversation_id: conversationIdRef.current,
@@ -614,15 +618,28 @@ export default function VoiceAssistant({
     recognition.onerror = (event: { error: string }) => {
       if (event.error === "no-speech") return;
       console.warn("Speech recognition notice:", event.error);
+      if (event.error === "not-allowed") {
+        setSpokenStatusText("Microphone access denied. Please grant microphone permission in your browser.");
+        stopVoiceSessionRef.current();
+        return;
+      }
+      if (event.error === "audio-capture") {
+        setSpokenStatusText("Microphone busy or not detected. Please verify your audio input settings.");
+        return;
+      }
+      if (event.error === "network") {
+        setSpokenStatusText("Speech recognition network error. Please check your connection.");
+        return;
+      }
     };
 
     recognition.onend = () => {
       if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
-        try {
-          recognition.start();
-        } catch {
-          // intentional no-op
-        }
+        setTimeout(() => {
+          if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+            resumeListeningRef.current();
+          }
+        }, 150);
       }
     };
 
@@ -642,9 +659,13 @@ export default function VoiceAssistant({
   const startVoiceSession = useCallback(async () => {
     setIsSessionActive(true);
     isSessionActiveRef.current = true;
-    await initAudioAnalyser();
-    resumeListeningRef.current();
     setSpokenStatusText("Listening to you...");
+    try {
+      await initAudioAnalyser();
+    } catch (err: unknown) {
+      console.warn("Audio analyser initialization skipped:", err);
+    }
+    resumeListeningRef.current();
   }, [initAudioAnalyser]);
 
   // Cleanup on unmount

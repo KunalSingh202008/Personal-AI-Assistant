@@ -732,7 +732,7 @@ export default function App() {
     if (loading) return;
     let content = input.trim();
     let turnId: string = crypto.randomUUID();
-    let baseMessages = messages;
+    let baseMessages: Message[];
 
     if (retry) {
       const assistantIndex = messages.findLastIndex(
@@ -746,8 +746,8 @@ export default function App() {
       baseMessages = messages.slice(0, userIndex);
     } else if (!content) {
       return;
-    } else if (retryTurnId && messages.at(-1)?.role === "assistant") {
-      baseMessages = messages.slice(0, -1);
+    } else {
+      baseMessages = messages;
     }
 
     // Append attached file hints if any
@@ -760,11 +760,10 @@ export default function App() {
     const nextMessages = retry
       ? [...baseMessages, userMessage, { role: "assistant" as const, content: "", turnId }]
       : [...messages, userMessage, { role: "assistant" as const, content: "", turnId }];
-    const assistantIndex = nextMessages.length - 1;
     setMessages(nextMessages);
     setInput("");
     setError("");
-    setRetryTurnId(turnId);
+    setRetryTurnId(null);
     setProgress([]);
     setChatSources([]);
     setAgentTask(null);
@@ -778,8 +777,8 @@ export default function App() {
 
     const appendAssistant = (text: string, append: boolean) => {
       setMessages((current) =>
-        current.map((message, index) =>
-          index === assistantIndex
+        current.map((message) =>
+          message.turnId === turnId && message.role === "assistant"
             ? { ...message, content: append ? message.content + text : text }
             : message,
         ),
@@ -951,6 +950,7 @@ export default function App() {
     } catch (reason) {
       if (!(reason instanceof DOMException && reason.name === "AbortError")) {
         setError(errorText(reason, "Unable to receive the response."));
+        setRetryTurnId(turnId);
       }
     } finally {
       if (activeRequest.current === controller) activeRequest.current = null;
