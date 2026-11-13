@@ -4,6 +4,7 @@ Provides multi-tier intent classification, multilingual parsing (English, Hindi,
 pronoun/entity awareness, and typed tool routing.
 """
 
+import os
 import re
 import json
 import logging
@@ -18,9 +19,10 @@ logger = logging.getLogger("kela.intent_engine")
 WAKE_WORDS = ["hey kela", "kela", "ok kela", "hello kela", "sun kela", "arrey kela", "oye kela"]
 
 HINDI_INDICATORS = [
-    "kholo", "chalao", "band karo", "badhao", "kam karo", "batao", "kya", "haal",
-    "kaise", "samay", "kitna", "hai", "aaj", "lo", "kar do", "sun", "dhundo", "dhundho",
-    "mera", "meri", "mere", "ise", "isko", "usko", "kaun", "hain", "karo", "dikhayo"
+    "kholo", "khol", "chalao", "band karo", "badhao", "kam karo", "batao", "kya", "haal",
+    "kaise", "samay", "kitna", "hai", "aaj", "lo", "kar do", "khol do", "do", "sun", "dhundo", "dhundho",
+    "mera", "meri", "mere", "ise", "isko", "usko", "kaun", "hain", "karo", "dikhayo",
+    "mein", "par", "pe", "dekho"
 ]
 
 UNSUPPORTED_PATTERNS = [
@@ -30,6 +32,25 @@ UNSUPPORTED_PATTERNS = [
     (r"\b(?:drive|fly)\s+(?:a\s+)?(?:car|airplane|plane|drone)\b", "piloting physical vehicles"),
     (r"\b(?:hack|infiltrate|ddos|bypass security)\b", "unauthorized cyber activities or hacking"),
 ]
+
+BROWSER_MAP = {
+    "brave": "brave",
+    "brave browser": "brave",
+    "edge": "edge",
+    "msedge": "edge",
+    "microsoft edge": "edge",
+    "microsoft edge browser": "edge",
+    "edge browser": "edge",
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "google chrome browser": "chrome",
+    "chrome browser": "chrome",
+    "firefox": "firefox",
+    "mozilla firefox": "firefox",
+    "firefox browser": "firefox",
+    "browser": "browser",
+    "default browser": "browser",
+}
 
 
 @dataclass
@@ -77,6 +98,242 @@ class IntentEngine:
 
     def __init__(self):
         pass
+
+    def _check_search_intent(self, lower: str, query: str, lang: str) -> Optional[IntentResult]:
+        """
+        Detects search requests targeted at YouTube, Google, GitHub, or web in browser.
+        Supports English, Hindi, and Hinglish.
+        """
+        # Pattern A: "search [for] <term> on (youtube|google|github)"
+        m = re.search(r'\bsearch\s+(?:for\s+)?(.+?)\s+on\s+(youtube|google|github)\b', lower)
+        if m:
+            term = m.group(1).strip()
+            engine = m.group(2).strip()
+            if term:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="search_web_in_browser",
+                    parameters={"query": term, "engine": engine},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # Pattern B: "search on (youtube|google|github) [for] <term>" or "search (youtube|google|github) for <term>"
+        m = re.search(r'\bsearch\s+(?:on\s+)?(youtube|google|github)\s+(?:for\s+)?(.+)', lower)
+        if m:
+            engine = m.group(1).strip()
+            term = m.group(2).strip()
+            if term:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="search_web_in_browser",
+                    parameters={"query": term, "engine": engine},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # Pattern C: "(youtube|google|github) search <term>"
+        m = re.search(r'^(youtube|google|github)\s+search\s+(.+)', lower)
+        if m:
+            engine = m.group(1).strip()
+            term = m.group(2).strip()
+            if term:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="search_web_in_browser",
+                    parameters={"query": term, "engine": engine},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # Pattern D (Hindi/Hinglish): "(youtube|google|github) (?:par|pe) <term> (?:search karo|dhundo|dhundho)"
+        m = re.search(r'\b(youtube|google|github)\s+(?:par|pe)\s+(.+?)\s+(?:search\s*(?:karo|kar do)?|dhundo|dhundho)\b', lower)
+        if m:
+            engine = m.group(1).strip()
+            term = m.group(2).strip()
+            term = re.sub(r'\s+ko$', '', term).strip()
+            if term:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="search_web_in_browser",
+                    parameters={"query": term, "engine": engine},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # Pattern E (Hindi/Hinglish): "(?:search karo|dhundo|dhundho) <term> (youtube|google|github) (?:par|pe)"
+        m = re.search(r'\b(?:search\s*karo|dhundo|dhundho)\s+(.+?)\s+(youtube|google|github)\s+(?:par|pe)\b', lower)
+        if m:
+            term = m.group(1).strip()
+            engine = m.group(2).strip()
+            if term:
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="search_web_in_browser",
+                    parameters={"query": term, "engine": engine},
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # Pattern F: General web search in browser: "search for <term> in browser" / "search web for <term>"
+        m = re.search(r'\bsearch\s+(?:for\s+)?(.+?)\s+in\s+browser\b', lower) or \
+            re.search(r'\bsearch\s+in\s+browser\s+(?:for\s+)?(.+)', lower) or \
+            re.search(r'\bsearch\s+(?:the\s+)?(?:web|internet)\s+(?:for\s+)?(.+)', lower)
+        if m:
+            term = m.group(1).strip()
+            if term and not re.search(r'\b(?:file|folder|document|pdf|resume|cv|project)\b', term):
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="search_web_in_browser",
+                    parameters={"query": term, "engine": "google"},
+                    confidence=0.95,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        return None
+
+    def _check_web_and_browser_intent(self, lower: str, query: str, lang: str) -> Optional[IntentResult]:
+        """
+        Detects requests to open browsers (Edge, Brave, Chrome, Firefox),
+        known websites (YouTube, Google, GitHub, etc.), or arbitrary URLs.
+        Supports English, Hindi, and Hinglish.
+        """
+        from pc_control import normalize_web_destination, KNOWN_WEBSITES
+
+        # 1. Target browser + Target destination:
+        # e.g., "open youtube in brave", "open google in edge", "open reddit.com in brave"
+        m1 = re.search(
+            r'\b(?:open|launch|start|kholo|chalao)\s+(.+?)\s+in\s+(brave(?:\s+browser)?|microsoft\s+edge|edge(?:\s+browser)?|msedge|google\s+chrome|chrome(?:\s+browser)?|mozilla\s+firefox|firefox(?:\s+browser)?|browser)\b',
+            lower
+        )
+        if m1:
+            raw_dest = m1.group(1).strip()
+            raw_browser = m1.group(2).strip()
+            canon_browser = BROWSER_MAP.get(raw_browser, raw_browser)
+            norm_url = normalize_web_destination(raw_dest)
+            if norm_url:
+                tool = "open_youtube" if raw_dest.lower() == "youtube" else "launch_browser"
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name=tool,
+                    parameters={
+                        "browser_name": canon_browser,
+                        "url": norm_url,
+                        "requested_destination": raw_dest,
+                        "app_name": f"open {raw_dest} in {canon_browser}",
+                    },
+                    confidence=0.99,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # 1b. Hinglish: "<browser> mein/me <target> kholo / open karo"
+        # e.g., "brave mein youtube kholo", "edge mein google open karo"
+        m1_hi = re.search(
+            r'\b(brave|microsoft\s+edge|edge|msedge|google\s+chrome|chrome|firefox|browser)\s+(?:mein|me)\s+(.+?)\s+(?:kholo|open\s*karo|chalao|start\s*karo)\b',
+            lower
+        )
+        if m1_hi:
+            raw_browser = m1_hi.group(1).strip()
+            raw_dest = m1_hi.group(2).strip()
+            canon_browser = BROWSER_MAP.get(raw_browser, raw_browser)
+            norm_url = normalize_web_destination(raw_dest)
+            if norm_url:
+                tool = "open_youtube" if raw_dest.lower() == "youtube" else "launch_browser"
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name=tool,
+                    parameters={
+                        "browser_name": canon_browser,
+                        "url": norm_url,
+                        "requested_destination": raw_dest,
+                        "app_name": f"open {raw_dest} in {canon_browser}",
+                    },
+                    confidence=0.99,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        # 2. Browser-only launch:
+        # e.g., "open brave", "launch microsoft edge", "open edge", "brave kholo", "edge khol do", "open browser"
+        m2 = re.search(
+            r'\b(?:open|launch|start|kholo|chalao)\s+(?:the\s+)?(brave(?:\s+browser)?|microsoft\s+edge|edge(?:\s+browser)?|msedge|google\s+chrome|chrome(?:\s+browser)?|mozilla\s+firefox|firefox(?:\s+browser)?|browser)\b',
+            lower
+        )
+        if not m2:
+            m2 = re.search(
+                r'\b(brave(?:\s+browser)?|microsoft\s+edge|edge(?:\s+browser)?|msedge|google\s+chrome|chrome(?:\s+browser)?|mozilla\s+firefox|firefox(?:\s+browser)?|browser)\s+(?:khol\s*do|kholo|chalao|open\s*karo)\b',
+                lower
+            )
+        if m2:
+            raw_browser = m2.group(1).strip()
+            canon_browser = BROWSER_MAP.get(raw_browser, raw_browser)
+            return IntentResult(
+                intent_type="ACTION",
+                tool_name="launch_browser",
+                parameters={"browser_name": canon_browser, "app_name": canon_browser},
+                confidence=0.98,
+                language=lang,
+                fast_path=True,
+            )
+
+        # 3. Known website or arbitrary URL destination
+        # e.g., "open youtube", "open google", "open github", "open reddit.com", "open https://..."
+        # Hinglish: "google khol do", "github kholo", "youtube chalao"
+        m3_candidates = []
+        m3_en = re.search(
+            r'\b(?:open|launch|start|go to|navigate to)\s+(?:the\s+|my\s+)?(?:website\s+|site\s+|url\s+|webpage\s+)?([^\s\?]+(?:\.[a-zA-Z]{2,}(?:/[^\s]*)?|[a-zA-Z0-9_\-]+))\b',
+            lower
+        )
+        if m3_en:
+            cand = m3_en.group(1).strip()
+            m3_candidates.append(cand)
+
+        m3_hi = re.search(
+            r'\b(?:website\s+|site\s+|url\s+)?([^\s\?]+(?:\.[a-zA-Z]{2,}(?:/[^\s]*)?|[a-zA-Z0-9_\-]+))\s+(?:khol\s*do|kholo|chalao|open\s*karo)\b',
+            lower
+        )
+        if m3_hi:
+            cand = m3_hi.group(1).strip()
+            m3_candidates.append(cand)
+
+        # Raw URL present directly in query (e.g. "https://github.com", "reddit.com")
+        url_match = re.search(r'(https?://[^\s<>"\']+|[a-zA-Z0-9_\-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?)', query)
+        if url_match:
+            cand = url_match.group(1).strip()
+            m3_candidates.append(cand)
+
+        for cand in m3_candidates:
+            cand_clean = cand.strip(".,;:!?\"'")
+            if not cand_clean or cand_clean in {"file", "folder", "project", "the", "this", "it", "that", "app", "application"}:
+                continue
+            # Exclude non-web native apps like calculator, camera, notepad, vscode, spotify
+            if cand_clean.lower() in {"calculator", "calc", "camera", "webcam", "notepad", "vscode", "vs code", "code", "spotify", "terminal", "task manager", "paint", "explorer"}:
+                continue
+
+            norm_url = normalize_web_destination(cand_clean)
+            if norm_url:
+                tool = "open_youtube" if cand_clean.lower() == "youtube" else "launch_browser"
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name=tool,
+                    parameters={
+                        "url": norm_url,
+                        "requested_destination": cand_clean,
+                        "app_name": cand_clean,
+                    },
+                    confidence=0.98,
+                    language=lang,
+                    fast_path=True,
+                )
+
+        return None
 
     def classify_intent(
         self,
@@ -278,6 +535,18 @@ class IntentEngine:
                     parameters={"app_name": app},
                     confidence=0.98,
                     language=lang,
+                )
+            # Resolved to website / URL launch
+            elif pronoun_meta.get("target_type") == "website":
+                url = pronoun_meta["resolved_target"]
+                return IntentResult(
+                    intent_type="ACTION",
+                    tool_name="launch_browser",
+                    parameters={"url": url, "requested_destination": url},
+                    confidence=0.98,
+                    language=lang,
+                    resolved_entity={"url": url, "type": "website"},
+                    fast_path=True,
                 )
 
         # -------------------------------------------------------------
@@ -681,104 +950,15 @@ class IntentEngine:
                 fast_path=True,
             )
 
-        # YouTube in Brave
-        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(brave)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "open youtube in brave", "browser_name": "brave", "url": "https://www.youtube.com"},
-                confidence=0.99,
-                language=lang,
-                fast_path=True,
-            )
+        # Structured Search Queries (YouTube, Google, GitHub, web in browser)
+        search_intent = self._check_search_intent(lower, query, lang)
+        if search_intent:
+            return search_intent
 
-        # YouTube in Chrome
-        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(chrome)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "open youtube in chrome", "browser_name": "chrome", "url": "https://www.youtube.com"},
-                confidence=0.99,
-                language=lang,
-                fast_path=True,
-            )
-
-        # YouTube in Edge
-        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(edge)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "open youtube in edge", "browser_name": "edge", "url": "https://www.youtube.com"},
-                confidence=0.99,
-                language=lang,
-                fast_path=True,
-            )
-
-        # YouTube
-        if re.search(r'\b(youtube)\b', lower) and re.search(r'\b(open|launch|play|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "youtube", "url": "https://www.youtube.com"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        # Brave Browser
-        if re.search(r'\b(brave|brave browser)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "brave", "browser_name": "brave"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        # Edge Browser
-        if re.search(r'\b(edge|msedge|microsoft edge)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "edge", "browser_name": "edge"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        # Chrome Browser
-        if re.search(r'\b(chrome|google chrome)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "chrome", "browser_name": "chrome"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        # Firefox Browser
-        if re.search(r'\b(firefox|mozilla firefox)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "firefox", "browser_name": "firefox"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
-
-        # Generic Browser
-        if re.search(r'\b(browser)\b', lower) and re.search(r'\b(open|launch|start|kholo|chalao)\b', lower):
-            return IntentResult(
-                intent_type="ACTION",
-                tool_name="launch_app",
-                parameters={"app_name": "browser"},
-                confidence=0.98,
-                language=lang,
-                fast_path=True,
-            )
+        # Structured Browser & Web Destination Launching (Edge, Brave, Chrome, YouTube, Google, GitHub, URLs)
+        web_intent = self._check_web_and_browser_intent(lower, query, lang)
+        if web_intent:
+            return web_intent
 
         # Generic Open / Launch Application
         open_app_match = re.search(
@@ -918,28 +1098,44 @@ class IntentEngine:
         params = intent.parameters
         status = result.get("status", "success")
 
-        # 1. Application Launch & Browsers
-        if tool_name in {"launch_app", "launch_calculator", "launch_camera", "launch_notepad", "launch_chrome", "launch_vscode", "launch_youtube", "launch_browser", "open_youtube"}:
+        # 1. Application Launch, Browsers, Websites & Web Searches
+        if tool_name in {
+            "launch_app", "launch_calculator", "launch_camera", "launch_notepad",
+            "launch_chrome", "launch_vscode", "launch_youtube", "launch_browser",
+            "open_youtube", "search_web_in_browser", "web_search", "web_search_in_browser"
+        }:
             res_obj = result.get("result") if isinstance(result.get("result"), dict) else result
             msg = res_obj.get("message") or result.get("message")
             browser = res_obj.get("browser") or params.get("browser_name")
             app = browser or params.get("app_name") or params.get("app") or tool_name.replace("launch_", "").replace("open_", "")
 
-            if status == "error" or res_obj.get("status") == "error":
-                if msg:
-                    return msg
+            # Strict verification check: If status == "error" or verified is False, report failure!
+            if status == "error" or res_obj.get("status") == "error" or res_obj.get("verified") is False:
+                err_msg = res_obj.get("message") or res_obj.get("error") or result.get("message") or result.get("error")
+                if err_msg:
+                    return err_msg
                 app_display = "Microsoft Edge" if str(app).lower() in {"edge", "msedge", "microsoft edge"} else (str(app).capitalize())
                 if lang == "hinglish":
-                    return f"{app_display} launch nahi ho saka."
-                return f"Failed to open {app_display}."
+                    return f"{app_display} launch nahi ho saka: launch verify nahi hua."
+                return f"Failed to open {app_display}: launch could not be verified."
 
-            # Success
-            url_target = params.get("url") or res_obj.get("target")
+            # Case A: Web search query in browser (YouTube search, Google search, GitHub search)
+            if tool_name in {"search_web_in_browser", "web_search", "web_search_in_browser"} or res_obj.get("engine"):
+                q_text = res_obj.get("query") or params.get("query", "")
+                engine_raw = str(res_obj.get("engine") or params.get("engine", "google")).lower()
+                engine_name = "YouTube" if engine_raw == "youtube" else ("GitHub" if engine_raw == "github" else "Google")
+                b_name = res_obj.get("browser") or browser or "browser"
+                if lang == "hinglish":
+                    return f"{b_name} mein {engine_name} par '{q_text}' search kar diya hai."
+                return f"Searched for '{q_text}' on {engine_name} in {b_name}."
+
+            # Case B: Specific Website / URL Destination
+            dest = res_obj.get("requested_destination") or params.get("requested_destination") or params.get("url") or res_obj.get("target") or res_obj.get("resolved_url")
+            raw_dest_lower = str(dest or "").lower()
             raw_app_lower = (params.get("app_name") or "").lower()
-            raw_url_lower = str(url_target or "").lower()
+            b_target = res_obj.get("browser") or browser
 
-            if "youtube" in raw_app_lower or "youtube" in raw_url_lower or tool_name == "open_youtube":
-                b_target = browser or ("Brave" if "brave" in raw_app_lower else ("Microsoft Edge" if "edge" in raw_app_lower else ("Google Chrome" if "chrome" in raw_app_lower else None)))
+            if "youtube" in raw_app_lower or "youtube" in raw_dest_lower or tool_name == "open_youtube":
                 if b_target:
                     if lang == "hinglish":
                         return f"{b_target} mein YouTube khol diya hai."
@@ -948,6 +1144,27 @@ class IntentEngine:
                     return "YouTube browser mein khol diya hai."
                 return "Opened YouTube in your browser."
 
+            if dest and raw_dest_lower not in {"browser", "default", "brave", "edge", "msedge", "chrome", "firefox"}:
+                if raw_dest_lower in {"google", "https://www.google.com"}:
+                    d_display = "Google"
+                elif raw_dest_lower in {"github", "https://github.com"}:
+                    d_display = "GitHub"
+                elif raw_dest_lower in {"amazon", "https://www.amazon.com"}:
+                    d_display = "Amazon"
+                elif raw_dest_lower in {"reddit", "reddit.com", "https://www.reddit.com", "https://reddit.com"}:
+                    d_display = "Reddit"
+                else:
+                    d_display = str(dest)
+
+                if b_target:
+                    if lang == "hinglish":
+                        return f"{b_target} mein {d_display} khol diya hai."
+                    return f"Opened {d_display} in {b_target}."
+                if lang == "hinglish":
+                    return f"Browser mein {d_display} khol diya hai."
+                return f"Opened {d_display} in browser."
+
+            # Case C: Direct Browser or Local Application Launch
             if str(app).lower() in {"edge", "msedge", "microsoft edge"}:
                 app_display = "Microsoft Edge"
             elif browser:
@@ -1151,23 +1368,6 @@ class IntentEngine:
             if lang == "hinglish":
                 return "Desktop screenshot capture kar liya hai."
             return "Desktop screenshot captured."
-
-        # 9. Browser Launching
-        if tool_name == "launch_browser":
-            res_obj = result.get("result", {})
-            b_name = res_obj.get("browser") or params.get("browser_name", "Browser")
-            url_target = params.get("url") or res_obj.get("target")
-            if status == "success" or res_obj.get("status") == "success":
-                if url_target and "youtube" in str(url_target).lower():
-                    if lang == "hinglish":
-                        return f"{b_name} mein YouTube khol diya hai."
-                    return f"Opened YouTube in {b_name}."
-                if lang == "hinglish":
-                    return f"{b_name} khol diya hai."
-                return f"Opened {b_name}."
-            else:
-                msg = res_obj.get("message") or result.get("message")
-                return msg or (f"{b_name} launch nahi ho saka." if lang == "hinglish" else f"Failed to launch {b_name}.")
 
         # 10. Duplicate Files Discovery
         if tool_name == "find_duplicate_files":

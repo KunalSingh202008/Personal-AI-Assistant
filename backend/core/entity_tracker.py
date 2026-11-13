@@ -26,6 +26,13 @@ class EntityTracker:
         with self._lock:
             return dict(self._state.get(conversation_id, {}))
 
+    def clear_context(self, conversation_id: Optional[int] = None):
+        with self._lock:
+            if conversation_id is None:
+                self._state.clear()
+            else:
+                self._state.pop(conversation_id, None)
+
     def update_context(self, conversation_id: Optional[int], **kwargs):
         if conversation_id is None:
             return
@@ -157,10 +164,15 @@ class EntityTracker:
                     }
                     st["last_entity_type"] = "file"
 
-            elif action_name == "launch_browser":
+            elif action_name in {"launch_browser", "open_youtube"}:
                 b_name = params.get("browser_name") or result.get("browser", "Browser")
                 st["last_app"] = b_name
                 st["last_entity_type"] = "app"
+                target_url = params.get("url") or result.get("resolved_url") or result.get("target")
+                if target_url and (str(target_url).startswith("http://") or str(target_url).startswith("https://")):
+                    st["last_url"] = str(target_url)
+                    st["last_website"] = str(target_url)
+                    st["last_entity_type"] = "website"
 
             elif action_name == "find_large_files":
                 files = result.get("files", []) if isinstance(result, dict) else []
@@ -265,6 +277,17 @@ class EntityTracker:
                 meta["resolved"] = True
                 meta["resolved_target"] = proj
                 meta["target_type"] = "project"
+                return resolved_text, meta
+
+        # 1b. Contextual Website reference ("is website ko browser mein kholo", "open this website", "open this link", "open that site")
+        if re.search(r'\b(?:is|this|the|that)\s+(?:website|link|site|page|url)\b', lower) or \
+           re.search(r'\b(?:website|link|site|url)\s+(?:kholo|open karo|chalao)\b', lower):
+            if ctx.get("last_url"):
+                url = ctx["last_url"]
+                resolved_text = f"open {url}"
+                meta["resolved"] = True
+                meta["resolved_target"] = url
+                meta["target_type"] = "website"
                 return resolved_text, meta
 
         # 2. "open it" / "kholo ise" / "open that" / "open the file" / "open the document" / "open the project"

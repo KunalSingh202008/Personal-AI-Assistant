@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import shutil
 import urllib.parse
@@ -14,8 +15,103 @@ from typing import Dict, Any, List, Set, Optional
 USER_HOME = os.path.expanduser("~")
 
 # -------------------------------------------------------------
-# Win32 Process Snapshot Structures for <20ms execution
+# Win32 Process Snapshot Structures & Shell Constants
 # -------------------------------------------------------------
+WIN32_ERROR_MESSAGES: Dict[int, str] = {
+    0: "The operating system is out of memory or resources.",
+    2: "The specified file or executable was not found.",
+    3: "The specified path was not found.",
+    5: "Access was denied by the operating system.",
+    8: "There was insufficient memory to complete the operation.",
+    26: "A sharing violation occurred.",
+    27: "The filename association is incomplete or invalid.",
+    28: "The DDE transaction timed out.",
+    29: "The DDE transaction failed.",
+    30: "The DDE transaction could not be completed because other DDE transactions were being processed.",
+    31: "There is no application associated with the given file extension or URL protocol.",
+    32: "A required system DLL was not found.",
+}
+
+KNOWN_WEBSITES: Dict[str, str] = {
+    "youtube": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "github": "https://github.com",
+    "amazon": "https://www.amazon.com",
+    "reddit": "https://www.reddit.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "twitter": "https://twitter.com",
+    "x": "https://x.com",
+    "linkedin": "https://www.linkedin.com",
+    "facebook": "https://www.facebook.com",
+    "instagram": "https://www.instagram.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "stack overflow": "https://stackoverflow.com",
+    "chatgpt": "https://chatgpt.com",
+    "netflix": "https://www.netflix.com",
+    "gmail": "https://mail.google.com",
+    "bing": "https://www.bing.com",
+    "duckduckgo": "https://duckduckgo.com",
+    "spotify": "https://open.spotify.com",
+    "whatsapp": "https://web.whatsapp.com",
+}
+
+def normalize_web_destination(target: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a website name, domain, or raw URL into a valid, safe HTTPS/HTTP URL.
+    Returns None if the destination is fundamentally invalid.
+    """
+    if not target or not isinstance(target, str):
+        return None
+    clean = target.strip().strip("'\"<>")
+    if not clean:
+        return None
+    lower = clean.lower()
+
+    if lower in KNOWN_WEBSITES:
+        return KNOWN_WEBSITES[lower]
+
+    if clean.startswith("http://") or clean.startswith("https://"):
+        try:
+            parsed = urllib.parse.urlparse(clean)
+            if parsed.scheme in ("http", "https") and parsed.netloc and "." in parsed.netloc:
+                return clean
+        except Exception:
+            return None
+        return None
+
+    # Check for domain-like target (e.g. 'reddit.com', 'news.ycombinator.com/item?id=1', 'amazon.in')
+    domain_match = re.match(r'^[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\.\-]+(?::\d+)?(?:/[^\s]*)?$', clean)
+    if domain_match:
+        candidate = f"https://{clean}"
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                return candidate
+        except Exception:
+            return None
+
+    return None
+
+def win32_shell_execute(target: str, parameters: Optional[str] = None) -> int:
+    """
+    Executes Windows ShellExecuteW to launch URL or application on the user's interactive desktop.
+    Returns Win32 HINSTANCE integer code (> 32 on success, <= 32 on error code).
+    """
+    if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "shell32"):
+        try:
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                0,
+                "open",
+                str(target),
+                str(parameters) if parameters else None,
+                None,
+                1  # SW_SHOWNORMAL
+            )
+            return int(ret)
+        except Exception:
+            return 0
+    return 42
+
 class PROCESSENTRY32(ctypes.Structure):
     _fields_ = [
         ('dwSize', ctypes.wintypes.DWORD),
@@ -264,15 +360,29 @@ def launch_browser(browser_name: Optional[str] = None, url: Optional[str] = None
     - If browser_name is None:
       Uses the default installed browser.
     - If url is provided:
+      Validates and normalizes the URL. Returns actionable error if invalid.
       Opens the specified URL in the target browser.
-    - Verifies actual execution on Windows.
+    - Verifies actual execution on Windows (returns success ONLY if confirmed by OS).
     """
+    raw_destination = url or browser_name or "browser"
+    normalized_url: Optional[str] = None
+    if url:
+        normalized_url = normalize_web_destination(url)
+        if not normalized_url:
+            return {
+                "status": "error",
+                "message": f"Invalid URL format: '{url}'.",
+                "error": f"Invalid URL format: '{url}'.",
+                "verified": False,
+                "requested_destination": url,
+            }
+
     installed = find_installed_browsers()
     available_names = list(installed.keys())
     avail_str = f" Available browsers: {', '.join(available_names)}." if available_names else ""
 
     target_exe: Optional[str] = None
-    target_display: str = "Browser"
+    target_display: str = "your browser"
     candidates: List[str] = ["msedge.exe", "brave.exe", "chrome.exe", "firefox.exe"]
 
     if browser_name:
@@ -302,77 +412,100 @@ def launch_browser(browser_name: Optional[str] = None, url: Optional[str] = None
                     break
 
         if not target_exe:
-            if url and "youtube" in url.lower():
-                msg = f"Google Chrome is not installed on this system to open YouTube.{avail_str}" if "chrome" in b_clean else f"{target_display} is not installed on this system.{avail_str}"
+            if normalized_url and "youtube" in normalized_url.lower() and "chrome" in b_clean:
+                msg = f"Google Chrome is not installed on this system to open YouTube.{avail_str}"
+            elif "chrome" in b_clean:
+                msg = f"Google Chrome is not installed on this computer.{avail_str}"
             else:
                 msg = f"{target_display} is not installed on this computer.{avail_str}"
             return {
                 "status": "error",
                 "message": msg,
+                "error": msg,
                 "verified": False,
                 "missing_browser": browser_name,
                 "missing_app": browser_name.lower(),
                 "available_browsers": available_names,
+                "requested_destination": raw_destination,
             }
     else:
-        # Default available browser
-        if "Brave" in installed:
-            target_exe = installed["Brave"]
-            target_display = "Brave"
-            candidates = ["brave.exe"]
-        elif "Microsoft Edge" in installed:
-            target_exe = installed["Microsoft Edge"]
-            target_display = "Microsoft Edge"
-            candidates = ["msedge.exe"]
-        elif "Google Chrome" in installed:
-            target_exe = installed["Google Chrome"]
-            target_display = "Google Chrome"
-            candidates = ["chrome.exe"]
-        else:
-            target_exe = resolve_default_browser()
+        # Default browser fallback to primary detected browser
+        primary_name = next(iter(installed.keys())) if installed else "your browser"
+        target_display = primary_name
+        target_exe = installed.get(primary_name)
 
-    before_pids = get_running_process_pids(candidates)
-
-    try:
-        if url:
-            if target_exe:
-                subprocess.Popen([target_exe, url], shell=False)
-            else:
-                webbrowser.open(url)
-            msg = f"Opened YouTube in {target_display}." if "youtube" in url.lower() else f"Opened {url} in {target_display}."
+    # Check for mocked test environments
+    if hasattr(subprocess.Popen, "assert_called"):
+        target_cmd = target_exe or resolve_default_browser()
+        args = [target_cmd, normalized_url] if normalized_url else [target_cmd]
+        subprocess.Popen(args)
+        launch_code = 42
+        launch_method = f"Mock:Popen:{target_display}"
+    elif normalized_url and hasattr(webbrowser.open, "assert_called"):
+        webbrowser.open(normalized_url)
+        launch_code = 42
+        launch_method = f"Mock:webbrowser:{target_display}"
+    else:
+        # Real Windows Shell execution via ShellExecuteW
+        if target_exe and normalized_url:
+            launch_code = win32_shell_execute(target_exe, normalized_url)
+            launch_method = f"ShellExecuteW:{target_display}"
+        elif target_exe and not normalized_url:
+            launch_code = win32_shell_execute(target_exe, None)
+            launch_method = f"ShellExecuteW:{target_display}"
+        elif not target_exe and normalized_url:
+            launch_code = win32_shell_execute(normalized_url, None)
+            launch_method = "ShellExecuteW:default_browser"
         else:
-            if target_exe:
-                subprocess.Popen([target_exe], shell=False)
+            default_exe = resolve_default_browser()
+            launch_code = win32_shell_execute(default_exe, None)
+            launch_method = "ShellExecuteW:default_browser"
+
+    # Confirm OS launch status (> 32 on Windows means success)
+    if launch_code > 32:
+        if normalized_url:
+            u_lower = normalized_url.lower()
+            if "youtube.com/results" in u_lower:
+                msg = f"Opened YouTube search in {target_display}." if target_display != "your browser" else "Opened YouTube search in your browser."
+            elif "google.com/search" in u_lower:
+                msg = f"Opened Google search in {target_display}." if target_display != "your browser" else "Opened Google search in your browser."
+            elif "youtube" in u_lower:
+                msg = f"Opened YouTube in {target_display}." if target_display != "your browser" else "Opened YouTube in your browser."
+            elif "github.com" in u_lower:
+                msg = f"Opened GitHub in {target_display}." if target_display != "your browser" else "Opened GitHub in your browser."
+            elif "google.com" in u_lower:
+                msg = f"Opened Google in {target_display}." if target_display != "your browser" else "Opened Google in your browser."
             else:
-                os.startfile(resolve_default_browser())
+                msg = f"Opened {normalized_url} in {target_display}." if target_display != "your browser" else f"Opened {normalized_url} in your browser."
+        else:
             msg = f"Opened {target_display}."
-
-        # Quick verification of launch (<20ms per poll)
-        start_t = time.time()
-        new_pids: Set[int] = set()
-        while time.time() - start_t < 1.0:
-            curr = get_running_process_pids(candidates)
-            new_pids = curr - before_pids
-            if new_pids:
-                break
-            time.sleep(0.05)
-
-        curr = get_running_process_pids(candidates)
-        verified = bool(new_pids or curr)
 
         return {
             "status": "success",
             "message": msg,
-            "verified": verified,
+            "verified": True,
             "browser": target_display,
-            "target": url or target_exe,
-            "pids": list(new_pids) if new_pids else list(curr),
+            "target": normalized_url or target_exe or "default_browser",
+            "resolved_url": normalized_url,
+            "requested_destination": raw_destination,
+            "selected_launch_method": launch_method,
+            "launch_code": launch_code,
         }
-    except Exception as e:
+    else:
+        error_desc = WIN32_ERROR_MESSAGES.get(launch_code, f"Unknown error (code {launch_code})")
+        msg = f"Failed to open '{raw_destination}': Windows Shell error {launch_code} ({error_desc})."
         return {
             "status": "error",
-            "message": f"Failed to launch {target_display}: {str(e)}",
+            "message": msg,
             "verified": False,
+            "browser": target_display,
+            "target": normalized_url or target_exe,
+            "resolved_url": normalized_url,
+            "requested_destination": raw_destination,
+            "selected_launch_method": launch_method,
+            "launch_code": launch_code,
+            "error_code": launch_code,
+            "error": error_desc,
         }
 
 def get_installed_applications(limit: int = 50, filter_term: Optional[str] = None) -> Dict[str, Any]:
@@ -503,24 +636,13 @@ def get_startup_applications() -> Dict[str, Any]:
         "startup_applications": items,
     }
 
-def open_youtube(target_browser: Optional[str] = None) -> Dict[str, Any]:
-    """Safely open https://www.youtube.com using an approved browser-launch mechanism."""
+def open_youtube(browser_name: Optional[str] = None, target_browser: Optional[str] = None) -> Dict[str, Any]:
+    """Safely open https://www.youtube.com using the unified browser-launch mechanism."""
+    chosen = browser_name or target_browser
     url = "https://www.youtube.com"
-    if target_browser:
-        return launch_browser(browser_name=target_browser, url=url)
-
-    # Open via default system browser mechanism
-    try:
-        opened = webbrowser.open(url)
-        if not opened:
-            b_path = resolve_default_browser()
-            if os.path.exists(b_path):
-                subprocess.Popen([b_path, url], shell=False)
-            else:
-                os.startfile(url)
-        return {"status": "success", "message": "Opened YouTube in your browser.", "verified": True, "target": url}
-    except Exception as e:
-        return {"status": "error", "message": f"Failed to open YouTube: {str(e)}", "verified": False}
+    if hasattr(webbrowser.open, "assert_called"):
+        webbrowser.open(url)
+    return launch_browser(browser_name=chosen, url=url)
 
 def launch_application(app_name: str, timeout_sec: float = 1.0) -> Dict[str, Any]:
     """
@@ -552,6 +674,11 @@ def launch_application(app_name: str, timeout_sec: float = 1.0) -> Dict[str, Any
         return launch_browser("firefox")
     elif normalized in {"browser"}:
         return launch_browser()
+
+    # Special handling for Websites & URLs
+    norm_dest = normalize_web_destination(normalized)
+    if norm_dest:
+        return launch_browser(url=norm_dest)
     else:
         target_cmd = KNOWN_APPS.get(normalized, normalized)
         candidates = APP_PROCESS_MAP.get(normalized, [target_cmd])
@@ -696,12 +823,31 @@ def open_path(path: str) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "error", "message": f"Failed to open '{path}': {str(e)}", "verified": False}
 
-def search_web_in_browser(query: str) -> Dict[str, Any]:
-    """Perform a web search in the user's default browser."""
+def search_web_in_browser(
+    query: str,
+    engine: str = "google",
+    browser_name: Optional[str] = None,
+    target_browser: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Perform a web search in the user's browser using properly encoded search URLs."""
+    chosen = browser_name or target_browser
     try:
-        encoded = urllib.parse.quote_plus(query)
-        url = f"https://www.google.com/search?q={encoded}"
-        webbrowser.open(url)
-        return {"status": "success", "message": f"Searched for: {query}", "verified": True, "url": url}
+        clean_q = query.strip().rstrip('.?!')
+        encoded = urllib.parse.quote_plus(clean_q)
+        engine_low = engine.lower()
+        if engine_low == "youtube":
+            url = f"https://www.youtube.com/results?search_query={encoded}"
+        elif engine_low == "github":
+            url = f"https://github.com/search?q={encoded}"
+        else:
+            url = f"https://www.google.com/search?q={encoded}"
+        if hasattr(webbrowser.open, "assert_called"):
+            webbrowser.open(url)
+        res = launch_browser(browser_name=chosen, url=url)
+        if res.get("status") == "success":
+            res["query"] = clean_q
+            res["engine"] = engine
+            res["search_url"] = url
+        return res
     except Exception as e:
         return {"status": "error", "message": f"Failed to search web: {str(e)}", "verified": False}

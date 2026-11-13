@@ -13,6 +13,10 @@ from .app_launcher import (
     launch_browser,
     get_installed_applications,
     get_startup_applications,
+    open_youtube,
+    normalize_web_destination,
+    win32_shell_execute,
+    KNOWN_WEBSITES,
 )
 from .volume_control import set_volume, change_volume, toggle_mute
 from .system_ops import get_system_metrics, list_running_processes, get_disk_space, find_large_files, open_folder

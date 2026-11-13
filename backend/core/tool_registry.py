@@ -256,6 +256,41 @@ PC_TOOL_SCHEMAS: List[Dict[str, Any]] = [
         }
     },
     {
+        "name": "open_youtube",
+        "description": "Open YouTube in a specified browser or system default browser.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "browser_name": {
+                    "type": "string",
+                    "description": "Optional name of browser ('brave', 'edge', 'chrome', 'firefox')."
+                }
+            }
+        }
+    },
+    {
+        "name": "search_web_in_browser",
+        "description": "Perform a web search for a query string in the browser (Google, YouTube, GitHub, etc.).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string."
+                },
+                "browser_name": {
+                    "type": "string",
+                    "description": "Optional name of browser to use."
+                },
+                "engine": {
+                    "type": "string",
+                    "description": "Optional search engine ('google', 'youtube', 'github')."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
         "name": "get_installed_applications",
         "description": "List genuine applications installed on this Windows PC via registry.",
         "parameters": {
@@ -373,9 +408,9 @@ SAFE_VOICE_ACTIONS = {
     # System & Audio
     "volume_up", "volume_down", "set_volume", "toggle_mute", "change_volume",
     # Native Apps & Tools
-    "launch_camera", "launch_youtube", "launch_chrome", "launch_vscode",
+    "launch_camera", "launch_youtube", "open_youtube", "launch_chrome", "launch_vscode",
     "launch_calculator", "launch_notepad", "launch_app", "close_app",
-    "launch_browser", "get_installed_applications", "get_startup_applications",
+    "launch_browser", "search_web_in_browser", "get_installed_applications", "get_startup_applications",
     # File & Status
     "find_resume", "find_resume_files", "open_latest_pdf", "open_downloads",
     "screenshot", "capture_desktop_screenshot", "battery_status", "system_status",
@@ -561,9 +596,17 @@ class ToolRegistry:
                 return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
 
             # 6. Web Search
-            elif tool_name in {"web_search", "web_search_in_browser"}:
+            elif tool_name in {"web_search", "web_search_in_browser", "search_web_in_browser"}:
                 query = arguments.get("query", "").strip()
-                res = pc_control.search_web_in_browser(query)
+                browser_name = arguments.get("browser_name")
+                engine = arguments.get("engine")
+                res = pc_control.search_web_in_browser(query, browser_name=browser_name, engine=engine)
+                return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
+
+            # 6b. Open YouTube
+            elif tool_name in {"open_youtube", "launch_youtube"}:
+                b_name = arguments.get("browser_name")
+                res = pc_control.open_youtube(browser_name=b_name)
                 return {"status": res.get("status", "success"), "result": res, "tool": tool_name}
 
             # 7. Run Project
