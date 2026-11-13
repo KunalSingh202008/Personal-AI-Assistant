@@ -347,6 +347,62 @@ class BrowserAndWebTests(unittest.TestCase):
         self.assertEqual(text_exec["result"]["browser"], voice_exec["result"]["browser"])
         self.assertEqual(text_exec["result"]["launch_code"], voice_exec["result"]["launch_code"])
 
+    # -------------------------------------------------------------
+    # Scenario 17: Verb stripping in launch_application
+    # -------------------------------------------------------------
+    @patch("pc_control.app_launcher.win32_shell_execute", return_value=42)
+    def test_scenario_17_verb_stripping_in_launch_application(self, mock_shell):
+        from pc_control.app_launcher import launch_application
+
+        # 17a: "Open Microsoft Edge"
+        res_edge = launch_application("Open Microsoft Edge")
+        self.assertEqual(res_edge["status"], "success")
+        self.assertEqual(res_edge["browser"], "Microsoft Edge")
+        self.assertTrue(res_edge["verified"])
+
+        # 17b: "Open Brave"
+        res_brave = launch_application("Open Brave")
+        self.assertEqual(res_brave["status"], "success")
+        self.assertEqual(res_brave["browser"], "Brave")
+        self.assertTrue(res_brave["verified"])
+
+        # 17c: "Open GitHub"
+        res_gh = launch_application("Open GitHub")
+        self.assertEqual(res_gh["status"], "success")
+        self.assertEqual(res_gh["resolved_url"], "https://github.com")
+        self.assertTrue(res_gh["verified"])
+
+        # 17d: "Open Google"
+        res_goog = launch_application("Open Google")
+        self.assertEqual(res_goog["status"], "success")
+        self.assertEqual(res_goog["resolved_url"], "https://www.google.com")
+        self.assertTrue(res_goog["verified"])
+
+        # 17e: "Open https://github.com/torvalds/linux"
+        res_url = launch_application("Open https://github.com/torvalds/linux")
+        self.assertEqual(res_url["status"], "success")
+        self.assertEqual(res_url["resolved_url"], "https://github.com/torvalds/linux")
+        self.assertTrue(res_url["verified"])
+
+    # -------------------------------------------------------------
+    # Scenario 18: normalize_web_destination prefix/suffix stripping
+    # -------------------------------------------------------------
+    def test_scenario_18_normalize_web_destination_prefixes(self):
+        self.assertEqual(normalize_web_destination("open github"), "https://github.com")
+        self.assertEqual(normalize_web_destination("launch google"), "https://www.google.com")
+        self.assertEqual(normalize_web_destination("go to reddit.com"), "https://reddit.com")
+        self.assertEqual(normalize_web_destination("kholo youtube"), "https://www.youtube.com")
+        self.assertEqual(normalize_web_destination("github kholo"), "https://github.com")
+
+    # -------------------------------------------------------------
+    # Scenario 19: ensure_interactive_desktop verification
+    # -------------------------------------------------------------
+    def test_scenario_19_ensure_interactive_desktop(self):
+        from pc_control.app_launcher import ensure_interactive_desktop
+        # Must execute without exception and return a boolean
+        result = ensure_interactive_desktop()
+        self.assertIsInstance(result, bool)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,6 +55,27 @@ KNOWN_WEBSITES: Dict[str, str] = {
     "whatsapp": "https://web.whatsapp.com",
 }
 
+def ensure_interactive_desktop() -> bool:
+    """
+    Ensure the current thread is attached to the interactive desktop (WinSta0\\Default).
+    This guarantees that windows launched by ShellExecute or GUI processes appear on the
+    logged-in user's physical screen rather than an isolated or background desktop.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        hwinsta = user32.OpenWindowStationW("WinSta0", False, 0x037F)
+        if hwinsta:
+            user32.SetProcessWindowStation(hwinsta)
+        hdesk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+            return True
+    except Exception:
+        pass
+    return False
+
 def normalize_web_destination(target: Optional[str]) -> Optional[str]:
     """
     Normalizes a website name, domain, or raw URL into a valid, safe HTTPS/HTTP URL.
@@ -65,6 +86,19 @@ def normalize_web_destination(target: Optional[str]) -> Optional[str]:
     clean = target.strip().strip("'\"<>")
     if not clean:
         return None
+
+    # Strip action prefixes if present
+    stripped = re.sub(
+        r'^(?:open|launch|start|run|go to|navigate to|kholo|chalao)\s+(?:the\s+|my\s+)?(?:website\s+|site\s+|url\s+|webpage\s+)?',
+        '',
+        clean,
+        flags=re.IGNORECASE
+    ).strip()
+    # Strip trailing verbs
+    stripped = re.sub(r'\s+(?:kholo|chalao|khol do|open karo|start karo|chala do)$', '', stripped, flags=re.IGNORECASE).strip()
+    if stripped:
+        clean = stripped
+
     lower = clean.lower()
 
     if lower in KNOWN_WEBSITES:
@@ -96,21 +130,46 @@ def win32_shell_execute(target: str, parameters: Optional[str] = None) -> int:
     """
     Executes Windows ShellExecuteW to launch URL or application on the user's interactive desktop.
     Returns Win32 HINSTANCE integer code (> 32 on success, <= 32 on error code).
+    Falls back to PowerShell Start-Process with explicit lpDesktop targeting WinSta0\\Default
+    if ShellExecuteW returns <= 32 or fails.
     """
+    ensure_interactive_desktop()
+    ret = 0
     if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "shell32"):
         try:
-            ret = ctypes.windll.shell32.ShellExecuteW(
+            ret = int(ctypes.windll.shell32.ShellExecuteW(
                 0,
                 "open",
                 str(target),
                 str(parameters) if parameters else None,
                 None,
                 1  # SW_SHOWNORMAL
-            )
-            return int(ret)
+            ))
         except Exception:
-            return 0
-    return 42
+            ret = 0
+
+    if ret > 32:
+        return ret
+
+    # Resilient fallback: PowerShell Start-Process bound to interactive desktop WinSta0\Default
+    try:
+        si = subprocess.STARTUPINFO()
+        si.lpDesktop = r"WinSta0\Default"
+        if parameters:
+            ps_cmd = f"Start-Process -FilePath '{target}' -ArgumentList '{parameters}'"
+        else:
+            ps_cmd = f"Start-Process '{target}'"
+        proc = subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            startupinfo=si
+        )
+        proc.wait(timeout=3.0)
+        if proc.returncode == 0:
+            return 42
+    except Exception:
+        pass
+
+    return ret
 
 class PROCESSENTRY32(ctypes.Structure):
     _fields_ = [
@@ -649,39 +708,52 @@ def launch_application(app_name: str, timeout_sec: float = 1.0) -> Dict[str, Any
     Launch an application or URI and verify actual execution on Windows.
     Takes a pre-launch process snapshot to avoid false positives from already-running apps.
     """
-    normalized = app_name.strip().lower()
+    ensure_interactive_desktop()
+    raw = app_name.strip()
+    raw_clean = raw.strip("'\"<>")
+
+    # Strip action verbs: open, launch, start, run, chalao, kholo, etc.
+    cleaned = re.sub(
+        r'^(?:open|launch|start|run|chalao|kholo|open karo|start karo)\s+(?:the\s+|my\s+)?',
+        '',
+        raw_clean,
+        flags=re.IGNORECASE
+    ).strip()
+    cleaned = re.sub(r'\s+(?:kholo|chalao|khol do|open karo|start karo|chala do)$', '', cleaned, flags=re.IGNORECASE).strip()
+    normalized = (cleaned or raw_clean).lower()
 
     # Special handling for YouTube
-    if normalized in {"youtube", "open youtube"}:
+    if normalized == "youtube" or raw.lower() in {"youtube", "open youtube"}:
         return open_youtube()
-    if normalized in {"youtube in chrome", "open youtube in chrome"}:
-        return open_youtube(target_browser="chrome")
-    if normalized in {"youtube in brave", "open youtube in brave"}:
-        return open_youtube(target_browser="brave")
-    if normalized in {"youtube in edge", "open youtube in edge"}:
-        return open_youtube(target_browser="edge")
-    if normalized in {"youtube in firefox", "open youtube in firefox"}:
-        return open_youtube(target_browser="firefox")
+    if "youtube" in normalized:
+        if "chrome" in normalized:
+            return open_youtube(target_browser="chrome")
+        if "brave" in normalized:
+            return open_youtube(target_browser="brave")
+        if "edge" in normalized:
+            return open_youtube(target_browser="edge")
+        if "firefox" in normalized:
+            return open_youtube(target_browser="firefox")
 
     # Special handling for Browsers
     if normalized in {"brave", "brave browser", "open brave"}:
         return launch_browser("brave")
-    if normalized in {"edge", "microsoft edge", "open edge"}:
+    if normalized in {"edge", "microsoft edge", "open edge", "msedge", "edge browser", "microsoft edge browser"}:
         return launch_browser("edge")
-    if normalized in {"chrome", "google chrome", "open chrome"}:
+    if normalized in {"chrome", "google chrome", "open chrome", "chrome browser", "google chrome browser"}:
         return launch_browser("chrome")
-    if normalized in {"firefox", "mozilla firefox", "open firefox"}:
+    if normalized in {"firefox", "mozilla firefox", "open firefox", "firefox browser"}:
         return launch_browser("firefox")
-    elif normalized in {"browser"}:
+    elif normalized in {"browser", "default browser"}:
         return launch_browser()
 
     # Special handling for Websites & URLs
-    norm_dest = normalize_web_destination(normalized)
+    norm_dest = normalize_web_destination(raw) or normalize_web_destination(normalized)
     if norm_dest:
         return launch_browser(url=norm_dest)
     else:
-        target_cmd = KNOWN_APPS.get(normalized, normalized)
-        candidates = APP_PROCESS_MAP.get(normalized, [target_cmd])
+        target_cmd = KNOWN_APPS.get(normalized, KNOWN_APPS.get(raw.lower(), normalized))
+        candidates = APP_PROCESS_MAP.get(normalized, APP_PROCESS_MAP.get(raw.lower(), [target_cmd]))
 
     # Check for URLs, system folders, or general file paths
     is_uri_or_path = (
@@ -722,10 +794,13 @@ def launch_application(app_name: str, timeout_sec: float = 1.0) -> Dict[str, Any
         try:
             os.startfile(target_cmd)
         except Exception:
-            # Fallback to subprocess Popen
+            # Fallback to subprocess Popen targeting interactive desktop WinSta0\Default
+            si = subprocess.STARTUPINFO()
+            si.lpDesktop = r"WinSta0\Default"
             subprocess.Popen(
                 [target_cmd] if os.path.exists(target_cmd) else target_cmd,
                 shell=not os.path.exists(target_cmd),
+                startupinfo=si,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP") else 0
             )
 
